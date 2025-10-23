@@ -44,12 +44,12 @@ class dfc_parametrizer2(nn.Module):
             print(layer)
 
     def forward(self, x):
-        
+
         for i, linear in enumerate(self.linears):
             x = linear(x)
             if i < len(self.linears):
-                
-                
+
+
                 x = F.relu(x)
         return x
 
@@ -77,12 +77,12 @@ class dfc_parametrizer(nn.Module):
         self.linear4 = nn.Linear(hdim3, nconcept * dout)
 
     def forward(self, x):
-        
+
         p = F.tanh(self.linear1(x))
         p = F.tanh(self.linear2(p))
         p = F.tanh(self.linear3(p))
         #p = F.dropout(p, training=self.training)
-        p = self.linear4(p) 
+        p = self.linear4(p)
         if self.dout > 1:
             p = p.view(p.shape[0], self.nconcept, self.dout)
         return p
@@ -293,11 +293,11 @@ class text_parametrizer(nn.Module):
                 autograd.Variable(torch.zeros(1, 1, self.hidden_dim)))
 
     def forward(self, sentence):
-        
+
         embeds = self.embedding_layer(sentence.squeeze(1))
         x = embeds.transpose(0,1)
         lstm_out, self.hidden = self.lstm(x, self.hidden)
-        y = self.hidden2label(lstm_out) 
+        y = self.hidden2label(lstm_out)
         #out = F.sigmoid(y).transpose(0,1)  # Now it's b x L x 1
         out = F.softmax(y, 1).transpose(0,1)
         return out

@@ -19,7 +19,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 # Standard Imports
 import sys, os
 import numpy as np
-import pdb
 import pickle
 import argparse
 import operator
@@ -143,7 +142,7 @@ def main():
         conceptizer  = input_conceptizer()
         args.nconcepts = args.input_dim + int(not args.nobias)
     elif args.h_type == 'cnn':
-        
+
         # biase. They treat it like any other concept.
         #args.nconcepts +=     int(not args.nobias)
         conceptizer  = image_cnn_conceptizer(args.input_dim, args.nconcepts, args.concept_dim, nchannel = 3) #, sparsity = sparsity_l)
@@ -305,7 +304,7 @@ def main():
 
     pickle.dump(All_Results, open(results_path + '_combined_metrics.pkl'.format(dataname), "wb"))
 
-    
+
     # args.epoch_stats = epoch_stats
     # save_path = args.results_path
     # print("Save train/dev results to", save_path)

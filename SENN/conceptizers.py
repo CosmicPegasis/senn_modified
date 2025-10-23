@@ -16,7 +16,6 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
-import pdb
 import numpy as np
 
 import torch
@@ -24,7 +23,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.autograd import Function
-from torch.legacy import nn as nn_legacy
 from torch.autograd import Variable
 
 #===============================================================================
@@ -198,7 +196,7 @@ class image_cnn_conceptizer(AutoEncoder):
 
 
     def encode(self, x):
-        
+
         p       = F.relu(F.max_pool2d(self.conv1(x), 2))
         p       = F.relu(F.max_pool2d(self.conv2(p), 2))
         encoded = self.linear(p.view(-1, self.nconcept, self.dout**2))
@@ -213,7 +211,7 @@ class image_cnn_conceptizer(AutoEncoder):
     #
     #
     # def forward(self, x):
-    #     
+    #
     #
     #     # Encoding
     #     p       = F.relu(F.max_pool2d(self.conv1(x), 2))

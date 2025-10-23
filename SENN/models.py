@@ -219,6 +219,7 @@ class GSENN(nn.Module):
             # .mul(self.l1weight) # Save sparsity loss, will be used by trainer
             self.h_norm_l1 = h_x.norm(p=1)
         else:
+            # TODO: Modify this for modern pytorch get rid of autograd.Variable and use just with torch.no_grad()
             h_x = self.conceptizer(
                 autograd.Variable(x.data, requires_grad=False))
 
@@ -314,13 +315,13 @@ class GSENN(nn.Module):
             # desired class
             _, idx = torch.max(out, 1)
             y = idx.data
-            
+
             attr = theta.gather(
                 2, y.view(-1, 1).unsqueeze(2).repeat(1, theta.shape[1], theta.shape[2]))[:, :, 0]
         elif (y == 'all') or (y is None):
             # retrieve explanation for all classes
             attr = theta
-        
+
         if (not skip_bias) and self.conceptizer.add_bias:
             pdb.set_trace()
             print('here')
