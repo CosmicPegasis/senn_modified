@@ -92,13 +92,18 @@ class DeepPacketNPYDataset(Dataset):
         if not self.files:
             raise RuntimeError(f"No .npy files found under {root}")
 
+        # Count rows in each file (using lazy memmap - doesn't load data into memory)
         self.counts: List[int] = []
         for path, _ in self.files:
+            # Use memmap mode to avoid loading entire file into memory
+            # This is lazy - only reads file header to get shape
             arr = np.load(path, mmap_mode="r")
             nrows = 1 if arr.ndim == 1 else int(arr.shape[0])
             if max_rows_per_file is not None:
                 nrows = min(nrows, max_rows_per_file)
             self.counts.append(nrows)
+            # Note: arr reference is dropped here, but memmap handle stays open
+            # This is fine - memmap is lazy and doesn't consume memory until accessed
         
         self.offsets = np.cumsum([0] + self.counts)
         self.total = int(self.offsets[-1])
@@ -108,6 +113,9 @@ class DeepPacketNPYDataset(Dataset):
         # Calculate class distribution for imbalance handling
         self.class_counts = self._calculate_class_counts()
         self.class_weights = self._calculate_class_weights(method=weight_method)
+        
+        # Cache memmap arrays to avoid repeated file opening
+        self._memmaps = {}
 
     def __len__(self) -> int:
         return self.total
@@ -220,11 +228,19 @@ class DeepPacketNPYDataset(Dataset):
         """Get a sample from the dataset."""
         fidx, ridx = self._locate(idx)
         path, y = self.files[fidx]
-        arr = np.load(path, mmap_mode="r")
+        
+        # Cache memmap arrays to avoid repeated file opening (major performance improvement)
+        if fidx not in self._memmaps:
+            self._memmaps[fidx] = np.load(path, mmap_mode="r")
+        arr = self._memmaps[fidx]
+        
         vec = arr if arr.ndim == 1 else arr[ridx]
         vec = _normalize_packet_vector(vec)
-        x = torch.tensor(vec, dtype=torch.float32).contiguous().view(1, 1, -1)
-        return x, torch.tensor(y, dtype=torch.long)
+        # Use torch.from_numpy for zero-copy when array is already contiguous float32
+        # _normalize_packet_vector ensures vec is contiguous float32
+        x = torch.from_numpy(vec).view(1, 1, -1)
+        # For scalar labels, use as_tensor for efficiency
+        return x, torch.as_tensor(y, dtype=torch.long)
 
 
 class UndersampledDeepPacketNPYDataset(Dataset):
@@ -295,6 +311,9 @@ class UndersampledDeepPacketNPYDataset(Dataset):
         # Calculate class counts for the undersampled dataset
         self.class_counts = self._calculate_class_counts()
         self.class_weights = self._calculate_class_weights()
+        
+        # Cache memmap arrays to avoid repeated file opening
+        self._memmaps = {}
     
     def __len__(self) -> int:
         return self.total
@@ -362,11 +381,18 @@ class UndersampledDeepPacketNPYDataset(Dataset):
         # Get the actual row index from the sampling indices
         actual_row = self.sampling_indices[fidx][ridx]
         
-        arr = np.load(path, mmap_mode="r")
+        # Cache memmap arrays to avoid repeated file opening (major performance improvement)
+        if fidx not in self._memmaps:
+            self._memmaps[fidx] = np.load(path, mmap_mode="r")
+        arr = self._memmaps[fidx]
+        
         vec = arr if arr.ndim == 1 else arr[actual_row]
         vec = _normalize_packet_vector(vec)
-        x = torch.tensor(vec, dtype=torch.float32).contiguous().view(1, 1, -1)
-        return x, torch.tensor(y, dtype=torch.long)
+        # Use torch.from_numpy for zero-copy when array is already contiguous float32
+        # _normalize_packet_vector ensures vec is contiguous float32
+        x = torch.from_numpy(vec).view(1, 1, -1)
+        # For scalar labels, use as_tensor for efficiency
+        return x, torch.as_tensor(y, dtype=torch.long)
 
 
 class FlowAwareDeepPacketDataset(DeepPacketNPYDataset):
@@ -432,6 +458,9 @@ class SelectedRowsDeepPacketDataset(Dataset):
 
         self.class_counts = self._calculate_class_counts()
         self.class_weights = self._calculate_class_weights(method=weight_method)
+        
+        # Cache memmap arrays to avoid repeated file opening
+        self._memmaps = {}
 
     def __len__(self) -> int:
         return self.total
@@ -548,9 +577,17 @@ class SelectedRowsDeepPacketDataset(Dataset):
         fidx, ridx = self._locate(idx)
         path, y = self.files[fidx]
         actual_row = self.sampling_indices[fidx][ridx]
-        arr = np.load(path, mmap_mode="r")
+        
+        # Cache memmap arrays to avoid repeated file opening (major performance improvement)
+        if fidx not in self._memmaps:
+            self._memmaps[fidx] = np.load(path, mmap_mode="r")
+        arr = self._memmaps[fidx]
+        
         vec = arr if arr.ndim == 1 else arr[actual_row]
         vec = _normalize_packet_vector(vec)
-        x = torch.tensor(vec, dtype=torch.float32).contiguous().view(1, 1, -1)
-        return x, torch.tensor(y, dtype=torch.long)
+        # Use torch.from_numpy for zero-copy when array is already contiguous float32
+        # _normalize_packet_vector ensures vec is contiguous float32
+        x = torch.from_numpy(vec).view(1, 1, -1)
+        # For scalar labels, use as_tensor for efficiency
+        return x, torch.as_tensor(y, dtype=torch.long)
 

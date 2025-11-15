@@ -152,6 +152,8 @@ def build_args() -> TrainArgs:
         help="Enable SHAP explanations (requires shap package). Disabled by default.")
     parser.add_argument("--use_lime", action="store_true", default=False,
         help="Enable LIME explanations (requires lime package). Disabled by default.")
+    parser.add_argument("--num_workers", type=int, default=None,
+        help="Number of data loading workers (default: auto-detect based on CPU count, min 2)")
 
     args_ns = parser.parse_args()
 
@@ -190,6 +192,16 @@ def build_args() -> TrainArgs:
     args.flow_test_size = args_ns.flow_test_size  # type: ignore[attr-defined]
     args.use_shap = args_ns.use_shap  # type: ignore[attr-defined]
     args.use_lime = args_ns.use_lime  # type: ignore[attr-defined]
+    
+    # Auto-detect num_workers if not specified
+    if args_ns.num_workers is None:
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        # Use min of 4 workers or half of CPU count, but at least 2
+        args.num_workers = max(2, min(4, cpu_count // 2))  # type: ignore[attr-defined]
+    else:
+        args.num_workers = args_ns.num_workers  # type: ignore[attr-defined]
+    
     return args
 
 def print_full_config(args, model=None):
@@ -271,7 +283,7 @@ def main():
         train_loader, test_loader, train_ds, test_ds = load_flow_train_test_split(
             split_manifest_path=args.use_flow_split_manifest,  # type: ignore[arg-type]
             batch_size=args.batch_size,
-            num_workers=2,
+            num_workers=args.num_workers,  # type: ignore[arg-type]
             weight_method=args.weight_method,
             handle_imbalance=args.handle_imbalance,
             undersample=args.undersample,
@@ -279,6 +291,7 @@ def main():
             undersample_strategy=args.undersample_strategy,
             max_rows_per_file=args.max_rows_per_file,
             root_override=args.root,  # Allow overriding manifest root for cross-system compatibility
+            pin_memory=args.cuda,  # Enable pin_memory when using GPU
         )
         valid_loader = None
     else:
@@ -287,7 +300,7 @@ def main():
                 root=args.root,
                 valid_size=0.1, test_size=0.1,
                 batch_size=args.batch_size,
-                num_workers=2,
+                num_workers=args.num_workers,  # type: ignore[arg-type]
                 weight_method=args.weight_method,
                 max_rows_per_file=args.max_rows_per_file,
                 handle_imbalance=args.handle_imbalance,
@@ -295,13 +308,14 @@ def main():
                 undersample=args.undersample,
                 undersample_ratio=args.undersample_ratio,
                 undersample_strategy=args.undersample_strategy,
+                pin_memory=args.cuda,  # Enable pin_memory when using GPU
             )
         else:
             train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds = split_deeppacket(
                 root=args.root,
                 valid_size=0.1, test_size=0.1,
                 batch_size=args.batch_size,
-                num_workers=2,
+                num_workers=args.num_workers,  # type: ignore[arg-type]
                 shuffle=True,
                 limit_files_per_split=args.limit_files_per_split,
                 max_rows_per_file=args.max_rows_per_file,
@@ -310,6 +324,7 @@ def main():
                 undersample=args.undersample,
                 undersample_ratio=args.undersample_ratio,
                 undersample_strategy=args.undersample_strategy,
+                pin_memory=args.cuda,  # Enable pin_memory when using GPU
             )
     # Comprehensive flow-based sanity checks (if using runtime flow split)
     # Skip for saved manifest path (no val split available, and we assume manifest is authoritative)

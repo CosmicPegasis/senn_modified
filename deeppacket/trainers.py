@@ -113,7 +113,8 @@ class ClassificationTrainer:
         """Compute concept learning loss (reconstruction + sparsity)."""
         if not hasattr(self.model, "recons") or self.model.recons is None or self.h_reconst_criterion is None:
             return torch.tensor(0.0, device=self.device)
-        recons_loss = self.h_reconst_criterion(self.model.recons, inputs.detach())
+        # Use inputs directly without detach to avoid creating new tensor
+        recons_loss = self.h_reconst_criterion(self.model.recons, inputs)
         all_losses["reconstruction"] = recons_loss.item()
         total = recons_loss
         if self.h_sparsity not in (-1, None) and hasattr(self.model, "h_norm_l1") and self.model.h_norm_l1 is not None:
@@ -137,8 +138,12 @@ class ClassificationTrainer:
         for i, (inputs, targets) in enumerate(train_loader):
             data_time.update(time.time() - end)
 
-            inputs = inputs.to(self.device)
-            targets = targets.to(self.device)
+            # Use non_blocking for async transfer if on GPU, check if already on device
+            non_blocking = self.device.type == 'cuda'
+            if inputs.device != self.device:
+                inputs = inputs.to(self.device, non_blocking=non_blocking)
+            if targets.device != self.device:
+                targets = targets.to(self.device, non_blocking=non_blocking)
 
             logits, loss, loss_dict = self.train_batch(inputs, targets)
             loss_dict["iter"] = i + (len(train_loader) * epoch)
@@ -148,7 +153,8 @@ class ClassificationTrainer:
                 acc1 = binary_accuracy_from_logits(logits, targets)
                 prec1, prec5 = [acc1], [100.0]
             else:
-                precs = multiclass_precision_at_k(logits.detach().cpu(), targets.detach().cpu(), topk=(1, min(5, self.nclasses)))
+                # Keep tensors on GPU for precision calculation
+                precs = multiclass_precision_at_k(logits.detach(), targets, topk=(1, min(5, self.nclasses)))
                 prec1 = float(precs[0].item())
                 prec5 = [float(precs[1].item())] if self.nclasses >= 5 else [prec1]
 
@@ -182,8 +188,12 @@ class ClassificationTrainer:
 
         with torch.no_grad():
             for i, (inputs, targets) in enumerate(val_loader):
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+                # Use non_blocking for async transfer if on GPU, check if already on device
+                non_blocking = self.device.type == 'cuda'
+                if inputs.device != self.device:
+                    inputs = inputs.to(self.device, non_blocking=non_blocking)
+                if targets.device != self.device:
+                    targets = targets.to(self.device, non_blocking=non_blocking)
 
                 output = self.model(inputs)
                 loss = self.prediction_criterion(
@@ -194,7 +204,8 @@ class ClassificationTrainer:
                     prec1 = binary_accuracy_from_logits(output, targets)
                     prec5 = [100.0]
                 else:
-                    precs = multiclass_precision_at_k(output.detach().cpu(), targets.detach().cpu(), topk=(1, min(5, self.nclasses)))
+                    # Keep tensors on GPU for precision calculation
+                    precs = multiclass_precision_at_k(output.detach(), targets, topk=(1, min(5, self.nclasses)))
                     prec1 = float(precs[0].item())
                     prec5 = [float(precs[1].item())] if self.nclasses >= 5 else [prec1]
 
@@ -226,8 +237,12 @@ class ClassificationTrainer:
 
         with torch.no_grad():
             for i, (data, targets) in enumerate(test_loader):
-                data = data.to(self.device)
-                targets = targets.to(self.device)
+                # Use non_blocking for async transfer if on GPU, check if already on device
+                non_blocking = self.device.type == 'cuda'
+                if data.device != self.device:
+                    data = data.to(self.device, non_blocking=non_blocking)
+                if targets.device != self.device:
+                    targets = targets.to(self.device, non_blocking=non_blocking)
 
                 output = self.model(data)
                 loss = self.prediction_criterion(
@@ -255,14 +270,19 @@ class ClassificationTrainer:
     def predict(self, test_loader) -> Tuple[np.ndarray, np.ndarray]:
         """Generate predictions for confusion matrix and other analyses."""
         self.model.eval()
-        all_preds = []
-        all_targets = []
         eval_batches = int(getattr(self.args, "eval_batches", 0) or 0)
 
         with torch.no_grad():
+            # Collect predictions on GPU, transfer to CPU in batches
+            pred_list = []
+            target_list = []
             for i, (data, targets) in enumerate(test_loader):
-                data = data.to(self.device)
-                targets = targets.to(self.device)
+                # Use non_blocking for async transfer if on GPU, check if already on device
+                non_blocking = self.device.type == 'cuda'
+                if data.device != self.device:
+                    data = data.to(self.device, non_blocking=non_blocking)
+                if targets.device != self.device:
+                    targets = targets.to(self.device, non_blocking=non_blocking)
 
                 output = self.model(data)
 
@@ -272,13 +292,22 @@ class ClassificationTrainer:
                 else:
                     pred = output.argmax(dim=1).view(-1)
 
-                all_preds.append(pred.cpu().numpy())
-                all_targets.append(targets.cpu().numpy())
-
+                # Keep on GPU, transfer to CPU in batch at end
+                pred_list.append(pred)
+                target_list.append(targets)
+                
                 if eval_batches and (i + 1) >= eval_batches:
                     break
+            
+            # Batch transfer to CPU for numpy conversion
+            if pred_list:
+                all_preds = torch.cat(pred_list).cpu().numpy()
+                all_targets = torch.cat(target_list).cpu().numpy()
+            else:
+                all_preds = np.array([], dtype=np.int64)
+                all_targets = np.array([], dtype=np.int64)
 
-        return np.concatenate(all_preds), np.concatenate(all_targets)
+        return all_preds, all_targets
 
 
 class GradPenaltyTrainer(ClassificationTrainer):
@@ -295,8 +324,13 @@ class GradPenaltyTrainer(ClassificationTrainer):
         """Train on a single batch with gradient penalty."""
         self.model.train()
         device = self.device
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+        # Inputs and targets should already be on device from train_epoch
+        # Only move if not already on device (defensive check)
+        if inputs.device != device:
+            inputs = inputs.to(device, non_blocking=device.type == 'cuda')
+        if targets.device != device:
+            targets = targets.to(device, non_blocking=device.type == 'cuda')
+        # Clone and detach for gradient computation
         inputs = inputs.clone().detach().requires_grad_(True)
         self.optimizer.zero_grad()
 

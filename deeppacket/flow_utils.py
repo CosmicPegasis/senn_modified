@@ -206,6 +206,7 @@ def split_deeppacket_by_flow(
     undersample: bool = False,
     undersample_ratio: float = 0.1,
     undersample_strategy: str = "random",
+    pin_memory: bool = False,
 ):
     """Split dataset by flow IDs, ensuring no flow overlap across splits."""
     # Build a flow-aware base dataset to discover counts/offsets/files.
@@ -250,7 +251,17 @@ def split_deeppacket_by_flow(
         for class_name, class_idx in train_ds.class_to_idx.items():
             print(f"  {class_name}: {train_ds.class_weights[class_idx]:.4f}")
 
-    dl_args = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=False)
+    # Optimize DataLoader settings: pin_memory for GPU, persistent_workers for efficiency
+    # These optimizations significantly improve GPU training performance
+    dl_args = dict(
+        batch_size=batch_size, 
+        num_workers=num_workers, 
+        pin_memory=pin_memory,  # Faster CPU->GPU transfer when using GPU
+    )
+    # Add advanced optimizations (PyTorch 1.7+)
+    if num_workers > 0:
+        dl_args['persistent_workers'] = True  # Keep workers alive between epochs
+        dl_args['prefetch_factor'] = 2  # Prefetch 2 batches per worker
     if handle_imbalance:
         sampler = WeightedRandomSampler(
             weights=train_ds.get_sample_weights(),
@@ -283,6 +294,7 @@ def split_deeppacket(
     undersample: bool = False,
     undersample_ratio: float = 0.1,
     undersample_strategy: str = "random",
+    pin_memory: bool = False,
 ):
     """Split dataset by files (not flow-aware)."""
     tmp = DeepPacketNPYDataset(root)
@@ -341,7 +353,17 @@ def split_deeppacket(
             weight = train_ds.class_weights[class_idx]
             print(f"  {class_name}: {weight:.4f}")
 
-    dl_args = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=False)
+    # Optimize DataLoader settings: pin_memory for GPU, persistent_workers for efficiency
+    # These optimizations significantly improve GPU training performance
+    dl_args = dict(
+        batch_size=batch_size, 
+        num_workers=num_workers, 
+        pin_memory=pin_memory,  # Faster CPU->GPU transfer when using GPU
+    )
+    # Add advanced optimizations (PyTorch 1.7+)
+    if num_workers > 0:
+        dl_args['persistent_workers'] = True  # Keep workers alive between epochs
+        dl_args['prefetch_factor'] = 2  # Prefetch 2 batches per worker
     
     # Create data loaders with optional weighted sampling
     if handle_imbalance:
@@ -455,6 +477,7 @@ def load_flow_train_test_split(
     undersample_strategy: str = "random",
     max_rows_per_file: Optional[int] = None,
     root_override: Optional[str] = None,
+    pin_memory: bool = False,
 ):
     """
     Load a previously saved flow-based train/test split manifest and return
@@ -582,7 +605,17 @@ def load_flow_train_test_split(
         for class_name, class_idx in train_ds.class_to_idx.items():
             print(f"  {class_name}: {train_ds.class_weights[class_idx]:.4f}")
 
-    dl_args = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=False)
+    # Optimize DataLoader settings: pin_memory for GPU, persistent_workers for efficiency
+    # These optimizations significantly improve GPU training performance
+    dl_args = dict(
+        batch_size=batch_size, 
+        num_workers=num_workers, 
+        pin_memory=pin_memory,  # Faster CPU->GPU transfer when using GPU
+    )
+    # Add advanced optimizations (PyTorch 1.7+)
+    if num_workers > 0:
+        dl_args['persistent_workers'] = True  # Keep workers alive between epochs
+        dl_args['prefetch_factor'] = 2  # Prefetch 2 batches per worker
     if handle_imbalance:
         sampler = WeightedRandomSampler(
             weights=train_ds.get_sample_weights(),
