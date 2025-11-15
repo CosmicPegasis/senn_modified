@@ -148,6 +148,8 @@ def build_args() -> TrainArgs:
         help="Create and save a new flow-based train/test split before training, then use it.")
     parser.add_argument("--flow_test_size", type=float, default=0.2,
         help="Test size for creating a new flow-based split when --save_flow_split is set.")
+    parser.add_argument("--use_gsenn", action="store_true", default=False,
+        help="Enable GSENN explanations. Disabled by default.")
     parser.add_argument("--use_shap", action="store_true", default=False,
         help="Enable SHAP explanations (requires shap package). Disabled by default.")
     parser.add_argument("--use_lime", action="store_true", default=False,
@@ -190,6 +192,7 @@ def build_args() -> TrainArgs:
     args.use_flow_split_manifest = args_ns.use_flow_split_manifest  # type: ignore[attr-defined]
     args.save_flow_split = args_ns.save_flow_split  # type: ignore[attr-defined]
     args.flow_test_size = args_ns.flow_test_size  # type: ignore[attr-defined]
+    args.use_gsenn = args_ns.use_gsenn  # type: ignore[attr-defined]
     args.use_shap = args_ns.use_shap  # type: ignore[attr-defined]
     args.use_lime = args_ns.use_lime  # type: ignore[attr-defined]
     
@@ -426,17 +429,35 @@ def main():
             print("\n" + "=" * 70)
             print(" GENERATING GLOBAL FEATURE EXPLANATIONS")
             print("=" * 70)
+            use_gsenn_flag = getattr(args, 'use_gsenn', False)
             use_shap_flag = getattr(args, 'use_shap', False)
             use_lime_flag = getattr(args, 'use_lime', False)
-            enabled_methods = ["GSENN"]
+            enabled_methods = []
+            if use_gsenn_flag:
+                enabled_methods.append("GSENN")
             if HAS_SHAP and use_shap_flag:
                 enabled_methods.append("SHAP")
             if HAS_LIME and use_lime_flag:
                 enabled_methods.append("LIME")
-            print("INFO: Processing samples in small batches to control memory usage.")
-            print(f"      Enabled methods: {', '.join(enabled_methods)}")
-            print("      Total samples per class: GSENN=100, SHAP=50, LIME=50")
-            print("=" * 70 + "\n")
+            
+            # Warn if GSENN is disabled
+            if not use_gsenn_flag:
+                print("WARNING: GSENN explanations are disabled by default. Use --use_gsenn to enable them.")
+                warnings.warn(
+                    "GSENN explanations are disabled by default. Use --use_gsenn to enable them.",
+                    UserWarning,
+                    stacklevel=2
+                )
+            
+            if not enabled_methods:
+                print("WARNING: No explanation methods enabled. Skipping feature explanations.")
+                print("         Use --use_gsenn, --use_shap, or --use_lime to enable explanations.")
+                print("=" * 70 + "\n")
+            else:
+                print("INFO: Processing samples in small batches to control memory usage.")
+                print(f"      Enabled methods: {', '.join(enabled_methods)}")
+                print("      Total samples per class: GSENN=100, SHAP=50, LIME=50")
+                print("=" * 70 + "\n")
             
             # Create feature names for packet bytes (0-1499)
             feature_names = [f"byte_{i}" for i in range(1500)]
@@ -488,19 +509,23 @@ def main():
             # Initialize explainers
             explainers = {}
             
-            # GSENN explainer
-            print("Creating GSENN explainer...")
-            explainers['GSENN'] = gsenn_wrapper(
-                trainer.model,
-                mode='classification',
-                input_type='feature',
-                multiclass=(args.nclasses > 2),
-                feature_names=feature_names,
-                class_names=class_names,
-                train_data=train_loader,
-                skip_bias=True,
-                verbose=False
-            )
+            # GSENN explainer (if enabled)
+            use_gsenn_flag = getattr(args, 'use_gsenn', False)
+            if not use_gsenn_flag:
+                print("Skipping GSENN explanations (disabled by default, use --use_gsenn to enable)")
+            if use_gsenn_flag:
+                print("Creating GSENN explainer...")
+                explainers['GSENN'] = gsenn_wrapper(
+                    trainer.model,
+                    mode='classification',
+                    input_type='feature',
+                    multiclass=(args.nclasses > 2),
+                    feature_names=feature_names,
+                    class_names=class_names,
+                    train_data=train_loader,
+                    skip_bias=True,
+                    verbose=False
+                )
             
             # SHAP explainer (if available and enabled) - MEMORY OPTIMIZED
             use_shap_flag = getattr(args, 'use_shap', False)
@@ -907,300 +932,304 @@ def main():
                 
                 return explanations_by_class
             
-            # Collect explanations from train and test sets for all explainers
-            # Keep original sample counts, but process in small batches to save memory
-            max_samples_per_class = {'GSENN': 100, 'SHAP': 50, 'LIME': 50}
-            # Batch sizes for incremental processing (process this many at a time, then aggregate)
-            batch_process_sizes = {'GSENN': 100, 'SHAP': 25, 'LIME': 25}  # Process in small batches
-            
-            all_train_explanations = {}
-            all_test_explanations = {}
-            
-            for explainer_name, explainer in explainers.items():
-                max_samples = max_samples_per_class.get(explainer_name, 200)
-                batch_size = batch_process_sizes.get(explainer_name, 10)
+            # Only proceed if we have at least one explainer enabled
+            if not explainers:
+                print("No explainers enabled. Skipping explanation generation.")
+            else:
+                # Collect explanations from train and test sets for all explainers
+                # Keep original sample counts, but process in small batches to save memory
+                max_samples_per_class = {'GSENN': 100, 'SHAP': 50, 'LIME': 50}
+                # Batch sizes for incremental processing (process this many at a time, then aggregate)
+                batch_process_sizes = {'GSENN': 100, 'SHAP': 25, 'LIME': 25}  # Process in small batches
                 
-                # Calculate max_batches based on max_samples_per_class and batch size
-                # Rough estimate: (max_samples * n_classes) / batch_size, with some buffer
-                # Also respect eval_batches if set
-                eval_batches_limit = getattr(args, 'eval_batches', 0) or 0
-                if eval_batches_limit > 0:
-                    # Use eval_batches as a hard limit
-                    max_batches_limit = eval_batches_limit
-                else:
-                    # Estimate: max_samples per class * n_classes / batch_size, with 2x buffer
-                    estimated_batches = int((max_samples * len(class_names)) / args.batch_size * 2)
-                    max_batches_limit = max(100, estimated_batches)  # At least 100 batches, but cap at reasonable limit
+                all_train_explanations = {}
+                all_test_explanations = {}
                 
-                print(f"\n{'='*70}")
-                print(f"Processing {explainer_name} explanations (max {max_samples} samples per class)")
-                print(f"  Processing in batches of {batch_size} to control memory")
-                print(f"  Max batches limit: {max_batches_limit}")
-                print(f"{'='*70}")
-                
-                # Clear memory before starting
-                gc.collect()
-                
-                all_train_explanations[explainer_name] = collect_explanations_for_dataset(
-                    train_loader, "train", explainer_name, explainer, 
-                    max_samples_per_class=max_samples,
-                    batch_process_size=batch_size,
-                    max_batches=max_batches_limit
-                )
-                
-                # Clear memory between train and test
-                gc.collect()
-                
-                all_test_explanations[explainer_name] = collect_explanations_for_dataset(
-                    test_loader, "test", explainer_name, explainer,
-                    max_samples_per_class=max_samples,
-                    batch_process_size=batch_size,
-                    max_batches=max_batches_limit
-                )
-                
-                # Clear memory after each explainer
-                gc.collect()
-                print(f"  Memory cleared after {explainer_name} processing")
-            
-            def aggregate_explanations_per_class(explanations_by_class):
-                """Aggregate explanations per class (mean, std, median)."""
-                aggregated = {}
-                for cls_idx, attr_list in explanations_by_class.items():
-                    if len(attr_list) == 0:
-                        aggregated[cls_idx] = {
-                            'mean': np.zeros(1500),
-                            'std': np.zeros(1500),
-                            'median': np.zeros(1500),
-                            'mean_abs': np.zeros(1500),
-                            'count': 0
-                        }
-                        continue
+                for explainer_name, explainer in explainers.items():
+                    max_samples = max_samples_per_class.get(explainer_name, 200)
+                    batch_size = batch_process_sizes.get(explainer_name, 10)
                     
-                    # Stack all attributions for this class
-                    attr_matrix = np.array(attr_list)  # (n_samples, 1500)
+                    # Calculate max_batches based on max_samples_per_class and batch size
+                    # Rough estimate: (max_samples * n_classes) / batch_size, with some buffer
+                    # Also respect eval_batches if set
+                    eval_batches_limit = getattr(args, 'eval_batches', 0) or 0
+                    if eval_batches_limit > 0:
+                        # Use eval_batches as a hard limit
+                        max_batches_limit = eval_batches_limit
+                    else:
+                        # Estimate: max_samples per class * n_classes / batch_size, with 2x buffer
+                        estimated_batches = int((max_samples * len(class_names)) / args.batch_size * 2)
+                        max_batches_limit = max(100, estimated_batches)  # At least 100 batches, but cap at reasonable limit
                     
-                    aggregated[cls_idx] = {
-                        'mean': np.mean(attr_matrix, axis=0),
-                        'std': np.std(attr_matrix, axis=0),
-                        'median': np.median(attr_matrix, axis=0),
-                        'mean_abs': np.mean(np.abs(attr_matrix), axis=0),
-                        'count': len(attr_list)
-                    }
-                return aggregated
-            
-            # Aggregate explanations for all explainers
-            print("\n" + "=" * 70)
-            print("Aggregating feature importance per class for all explainers...")
-            print("=" * 70)
-            
-            all_train_aggregated = {}
-            all_test_aggregated = {}
-            
-            for explainer_name in explainers.keys():
-                print(f"\nAggregating {explainer_name} explanations...")
-                all_train_aggregated[explainer_name] = aggregate_explanations_per_class(
-                    all_train_explanations[explainer_name]
-                )
-                all_test_aggregated[explainer_name] = aggregate_explanations_per_class(
-                    all_test_explanations[explainer_name]
-                )
-            
-            # Visualize global feature importance per class for all explainers
-            print("\n" + "=" * 70)
-            print("Generating global feature importance visualizations...")
-            print("=" * 70)
-            
-            n_classes = len(class_names)
-            n_explainers = len(explainers)
-            
-            # Create plots for each explainer
-            for explainer_name in explainers.keys():
-                train_aggregated = all_train_aggregated[explainer_name]
-                test_aggregated = all_test_aggregated[explainer_name]
-                
-                # Plot 1: Train set
-                fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
-                if n_classes == 1:
-                    axes = [axes]
-                
-                for cls_idx, class_name in enumerate(class_names):
-                    ax = axes[cls_idx]
-                    mean_abs = train_aggregated[cls_idx]['mean_abs']
+                    print(f"\n{'='*70}")
+                    print(f"Processing {explainer_name} explanations (max {max_samples} samples per class)")
+                    print(f"  Processing in batches of {batch_size} to control memory")
+                    print(f"  Max batches limit: {max_batches_limit}")
+                    print(f"{'='*70}")
                     
-                    # Get top K features
-                    top_k = min(50, len(mean_abs))
-                    top_indices = np.argsort(mean_abs)[-top_k:][::-1]
-                    top_values = train_aggregated[cls_idx]['mean'][top_indices]
+                    # Clear memory before starting
+                    gc.collect()
                     
-                    # Plot with color coding (positive/negative)
-                    colors = ['red' if v > 0 else 'blue' for v in top_values]
-                    ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
-                    ax.set_yticks(range(len(top_indices)))
-                    ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
-                    ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
-                    ax.set_title(
-                        f"Train Set - {class_name} ({explainer_name}) (n={train_aggregated[cls_idx]['count']} samples, "
-                        f"top {top_k} features by |mean|)",
-                        fontsize=11, fontweight='bold'
+                    all_train_explanations[explainer_name] = collect_explanations_for_dataset(
+                        train_loader, "train", explainer_name, explainer, 
+                        max_samples_per_class=max_samples,
+                        batch_process_size=batch_size,
+                        max_batches=max_batches_limit
                     )
-                    ax.grid(axis='x', alpha=0.3)
-                    ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
-                
-                plt.tight_layout()
-                train_expl_path = os.path.join(model_path, f'global_feature_importance_train_{explainer_name}.png')
-                plt.savefig(train_expl_path, dpi=300, bbox_inches='tight')
-                print(f"Train set global feature importance ({explainer_name}) saved to: {train_expl_path}")
-                # plt.show()
-                
-                # Plot 2: Test set
-                fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
-                if n_classes == 1:
-                    axes = [axes]
-                
-                for cls_idx, class_name in enumerate(class_names):
-                    ax = axes[cls_idx]
-                    mean_abs = test_aggregated[cls_idx]['mean_abs']
                     
-                    # Get top K features
-                    top_k = min(50, len(mean_abs))
-                    top_indices = np.argsort(mean_abs)[-top_k:][::-1]
-                    top_values = test_aggregated[cls_idx]['mean'][top_indices]
+                    # Clear memory between train and test
+                    gc.collect()
                     
-                    # Plot with color coding (positive/negative)
-                    colors = ['red' if v > 0 else 'blue' for v in top_values]
-                    ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
-                    ax.set_yticks(range(len(top_indices)))
-                    ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
-                    ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
-                    ax.set_title(
-                        f"Test Set - {class_name} ({explainer_name}) (n={test_aggregated[cls_idx]['count']} samples, "
-                        f"top {top_k} features by |mean|)",
-                        fontsize=11, fontweight='bold'
+                    all_test_explanations[explainer_name] = collect_explanations_for_dataset(
+                        test_loader, "test", explainer_name, explainer,
+                        max_samples_per_class=max_samples,
+                        batch_process_size=batch_size,
+                        max_batches=max_batches_limit
                     )
-                    ax.grid(axis='x', alpha=0.3)
-                    ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+                    
+                    # Clear memory after each explainer
+                    gc.collect()
+                    print(f"  Memory cleared after {explainer_name} processing")
                 
-                plt.tight_layout()
-                test_expl_path = os.path.join(model_path, f'global_feature_importance_test_{explainer_name}.png')
-                plt.savefig(test_expl_path, dpi=300, bbox_inches='tight')
-                print(f"Test set global feature importance ({explainer_name}) saved to: {test_expl_path}")
-                # plt.show()
-            
-            # Print summary statistics per class and write to file for all explainers
-            summary_lines = []
-            summary_lines.append("=" * 70)
-            summary_lines.append(" GLOBAL FEATURE IMPORTANCE SUMMARY")
-            summary_lines.append(f" Methods: {', '.join(explainers.keys())}")
-            summary_lines.append("=" * 70)
-            summary_lines.append("")
-            
-            print("\n" + "=" * 70)
-            print(" GLOBAL FEATURE IMPORTANCE SUMMARY")
-            print(f" Methods: {', '.join(explainers.keys())}")
-            print("=" * 70 + "\n")
-            
-            # Generate summary for each explainer
-            for explainer_name in explainers.keys():
-                train_aggregated = all_train_aggregated[explainer_name]
-                test_aggregated = all_test_aggregated[explainer_name]
-                
-                summary_lines.append(f"\n{'='*70}")
-                summary_lines.append(f" {explainer_name} EXPLANATIONS")
-                summary_lines.append(f"{'='*70}")
-                print(f"\n{'='*70}")
-                print(f" {explainer_name} EXPLANATIONS")
-                print(f"{'='*70}")
-                
-                for cls_idx, class_name in enumerate(class_names):
-                    summary_lines.append(f"\n{class_name}:")
-                    summary_lines.append(f"  Train samples: {train_aggregated[cls_idx]['count']}")
-                    summary_lines.append(f"  Test samples: {test_aggregated[cls_idx]['count']}")
-                    
-                    print(f"\n{class_name}:")
-                    print(f"  Train samples: {train_aggregated[cls_idx]['count']}")
-                    print(f"  Test samples: {test_aggregated[cls_idx]['count']}")
-                    
-                    # Get top features by mean absolute importance
-                    train_mean_abs = train_aggregated[cls_idx]['mean_abs']
-                    test_mean_abs = test_aggregated[cls_idx]['mean_abs']
-                    
-                    top_k = 20
-                    train_top_indices = np.argsort(train_mean_abs)[-top_k:][::-1]
-                    test_top_indices = np.argsort(test_mean_abs)[-top_k:][::-1]
-                    
-                    summary_lines.append(f"\n  Top {top_k} important bytes (Train Set):")
-                    summary_lines.append("    Byte | Mean | Std | Mean |abs||")
-                    summary_lines.append("    " + "-" * 50)
-                    print(f"\n  Top {top_k} important bytes (Train Set):")
-                    print("    Byte | Mean | Std | Mean |abs||")
-                    print("    " + "-" * 50)
-                    for idx in train_top_indices:
-                        mean_val = train_aggregated[cls_idx]['mean'][idx]
-                        std_val = train_aggregated[cls_idx]['std'][idx]
-                        mean_abs_val = train_mean_abs[idx]
-                        line = f"    byte_{idx:4d} | {mean_val:7.4f} | {std_val:6.4f} | {mean_abs_val:8.4f}"
-                        summary_lines.append(line)
-                        print(line)
-                    
-                    summary_lines.append(f"\n  Top {top_k} important bytes (Test Set):")
-                    summary_lines.append("    Byte | Mean | Std | Mean |abs||")
-                    summary_lines.append("    " + "-" * 50)
-                    print(f"\n  Top {top_k} important bytes (Test Set):")
-                    print("    Byte | Mean | Std | Mean |abs||")
-                    print("    " + "-" * 50)
-                    for idx in test_top_indices:
-                        mean_val = test_aggregated[cls_idx]['mean'][idx]
-                        std_val = test_aggregated[cls_idx]['std'][idx]
-                        mean_abs_val = test_mean_abs[idx]
-                        line = f"    byte_{idx:4d} | {mean_val:7.4f} | {std_val:6.4f} | {mean_abs_val:8.4f}"
-                        summary_lines.append(line)
-                        print(line)
-                    
-                    # Compare train vs test top features
-                    train_top_set = set(train_top_indices[:10])
-                    test_top_set = set(test_top_indices[:10])
-                    overlap = train_top_set & test_top_set
-                    overlap_line = f"\n  Top 10 feature overlap (Train ∩ Test): {len(overlap)}/10"
-                    summary_lines.append(overlap_line)
-                    print(overlap_line)
-                    if overlap:
-                        overlap_bytes = f"    Overlapping bytes: {sorted(overlap)}"
-                        summary_lines.append(overlap_bytes)
-                        print(overlap_bytes)
-                
-                # Compare explainers: find common top features across methods
-                if len(explainers) > 1:
-                    summary_lines.append(f"\n  Cross-Method Comparison:")
-                    print(f"\n  Cross-Method Comparison:")
-                    for cls_idx, class_name in enumerate(class_names):
-                        all_top_features = {}
-                        for exp_name in explainers.keys():
-                            agg = all_test_aggregated[exp_name]
-                            mean_abs = agg[cls_idx]['mean_abs']
-                            top_10 = set(np.argsort(mean_abs)[-10:][::-1])
-                            all_top_features[exp_name] = top_10
+                def aggregate_explanations_per_class(explanations_by_class):
+                    """Aggregate explanations per class (mean, std, median)."""
+                    aggregated = {}
+                    for cls_idx, attr_list in explanations_by_class.items():
+                        if len(attr_list) == 0:
+                            aggregated[cls_idx] = {
+                                'mean': np.zeros(1500),
+                                'std': np.zeros(1500),
+                                'median': np.zeros(1500),
+                                'mean_abs': np.zeros(1500),
+                                'count': 0
+                            }
+                            continue
                         
-                        # Find intersection of top features across all methods
-                        common_features = set.intersection(*all_top_features.values()) if all_top_features else set()
-                        summary_lines.append(f"    {class_name} - Common top 10 features across all methods: {len(common_features)}")
-                        print(f"    {class_name} - Common top 10 features across all methods: {len(common_features)}")
-                        if common_features:
-                            summary_lines.append(f"      Common bytes: {sorted(common_features)}")
-                            print(f"      Common bytes: {sorted(common_features)}")
-            
-            summary_lines.append("\n" + "=" * 70)
-            summary_lines.append(" GLOBAL FEATURE EXPLANATIONS COMPLETE")
-            summary_lines.append("=" * 70)
-            
-            # Write summary to file
-            summary_path = os.path.join(model_path, 'global_feature_importance_summary.txt')
-            with open(summary_path, 'w') as f:
-                f.write('\n'.join(summary_lines))
-            print(f"\nGlobal feature importance summary saved to: {summary_path}")
-            
-            print("\n" + "=" * 70)
-            print(" GLOBAL FEATURE EXPLANATIONS COMPLETE")
-            print("=" * 70 + "\n")
+                        # Stack all attributions for this class
+                        attr_matrix = np.array(attr_list)  # (n_samples, 1500)
+                        
+                        aggregated[cls_idx] = {
+                            'mean': np.mean(attr_matrix, axis=0),
+                            'std': np.std(attr_matrix, axis=0),
+                            'median': np.median(attr_matrix, axis=0),
+                            'mean_abs': np.mean(np.abs(attr_matrix), axis=0),
+                            'count': len(attr_list)
+                        }
+                    return aggregated
+                
+                # Aggregate explanations for all explainers
+                print("\n" + "=" * 70)
+                print("Aggregating feature importance per class for all explainers...")
+                print("=" * 70)
+                
+                all_train_aggregated = {}
+                all_test_aggregated = {}
+                
+                for explainer_name in explainers.keys():
+                    print(f"\nAggregating {explainer_name} explanations...")
+                    all_train_aggregated[explainer_name] = aggregate_explanations_per_class(
+                        all_train_explanations[explainer_name]
+                    )
+                    all_test_aggregated[explainer_name] = aggregate_explanations_per_class(
+                        all_test_explanations[explainer_name]
+                    )
+                
+                # Visualize global feature importance per class for all explainers
+                print("\n" + "=" * 70)
+                print("Generating global feature importance visualizations...")
+                print("=" * 70)
+                
+                n_classes = len(class_names)
+                n_explainers = len(explainers)
+                
+                # Create plots for each explainer
+                for explainer_name in explainers.keys():
+                    train_aggregated = all_train_aggregated[explainer_name]
+                    test_aggregated = all_test_aggregated[explainer_name]
+                    
+                    # Plot 1: Train set
+                    fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
+                    if n_classes == 1:
+                        axes = [axes]
+                    
+                    for cls_idx, class_name in enumerate(class_names):
+                        ax = axes[cls_idx]
+                        mean_abs = train_aggregated[cls_idx]['mean_abs']
+                        
+                        # Get top K features
+                        top_k = min(50, len(mean_abs))
+                        top_indices = np.argsort(mean_abs)[-top_k:][::-1]
+                        top_values = train_aggregated[cls_idx]['mean'][top_indices]
+                        
+                        # Plot with color coding (positive/negative)
+                        colors = ['red' if v > 0 else 'blue' for v in top_values]
+                        ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
+                        ax.set_yticks(range(len(top_indices)))
+                        ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
+                        ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
+                        ax.set_title(
+                            f"Train Set - {class_name} ({explainer_name}) (n={train_aggregated[cls_idx]['count']} samples, "
+                            f"top {top_k} features by |mean|)",
+                            fontsize=11, fontweight='bold'
+                        )
+                        ax.grid(axis='x', alpha=0.3)
+                        ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+                    
+                    plt.tight_layout()
+                    train_expl_path = os.path.join(model_path, f'global_feature_importance_train_{explainer_name}.png')
+                    plt.savefig(train_expl_path, dpi=300, bbox_inches='tight')
+                    print(f"Train set global feature importance ({explainer_name}) saved to: {train_expl_path}")
+                    # plt.show()
+                    
+                    # Plot 2: Test set
+                    fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
+                    if n_classes == 1:
+                        axes = [axes]
+                    
+                    for cls_idx, class_name in enumerate(class_names):
+                        ax = axes[cls_idx]
+                        mean_abs = test_aggregated[cls_idx]['mean_abs']
+                        
+                        # Get top K features
+                        top_k = min(50, len(mean_abs))
+                        top_indices = np.argsort(mean_abs)[-top_k:][::-1]
+                        top_values = test_aggregated[cls_idx]['mean'][top_indices]
+                        
+                        # Plot with color coding (positive/negative)
+                        colors = ['red' if v > 0 else 'blue' for v in top_values]
+                        ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
+                        ax.set_yticks(range(len(top_indices)))
+                        ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
+                        ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
+                        ax.set_title(
+                            f"Test Set - {class_name} ({explainer_name}) (n={test_aggregated[cls_idx]['count']} samples, "
+                            f"top {top_k} features by |mean|)",
+                            fontsize=11, fontweight='bold'
+                        )
+                        ax.grid(axis='x', alpha=0.3)
+                        ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+                    
+                    plt.tight_layout()
+                    test_expl_path = os.path.join(model_path, f'global_feature_importance_test_{explainer_name}.png')
+                    plt.savefig(test_expl_path, dpi=300, bbox_inches='tight')
+                    print(f"Test set global feature importance ({explainer_name}) saved to: {test_expl_path}")
+                    # plt.show()
+                
+                # Print summary statistics per class and write to file for all explainers
+                summary_lines = []
+                summary_lines.append("=" * 70)
+                summary_lines.append(" GLOBAL FEATURE IMPORTANCE SUMMARY")
+                summary_lines.append(f" Methods: {', '.join(explainers.keys())}")
+                summary_lines.append("=" * 70)
+                summary_lines.append("")
+                
+                print("\n" + "=" * 70)
+                print(" GLOBAL FEATURE IMPORTANCE SUMMARY")
+                print(f" Methods: {', '.join(explainers.keys())}")
+                print("=" * 70 + "\n")
+                
+                # Generate summary for each explainer
+                for explainer_name in explainers.keys():
+                    train_aggregated = all_train_aggregated[explainer_name]
+                    test_aggregated = all_test_aggregated[explainer_name]
+                    
+                    summary_lines.append(f"\n{'='*70}")
+                    summary_lines.append(f" {explainer_name} EXPLANATIONS")
+                    summary_lines.append(f"{'='*70}")
+                    print(f"\n{'='*70}")
+                    print(f" {explainer_name} EXPLANATIONS")
+                    print(f"{'='*70}")
+                    
+                    for cls_idx, class_name in enumerate(class_names):
+                        summary_lines.append(f"\n{class_name}:")
+                        summary_lines.append(f"  Train samples: {train_aggregated[cls_idx]['count']}")
+                        summary_lines.append(f"  Test samples: {test_aggregated[cls_idx]['count']}")
+                        
+                        print(f"\n{class_name}:")
+                        print(f"  Train samples: {train_aggregated[cls_idx]['count']}")
+                        print(f"  Test samples: {test_aggregated[cls_idx]['count']}")
+                        
+                        # Get top features by mean absolute importance
+                        train_mean_abs = train_aggregated[cls_idx]['mean_abs']
+                        test_mean_abs = test_aggregated[cls_idx]['mean_abs']
+                        
+                        top_k = 20
+                        train_top_indices = np.argsort(train_mean_abs)[-top_k:][::-1]
+                        test_top_indices = np.argsort(test_mean_abs)[-top_k:][::-1]
+                        
+                        summary_lines.append(f"\n  Top {top_k} important bytes (Train Set):")
+                        summary_lines.append("    Byte | Mean | Std | Mean |abs||")
+                        summary_lines.append("    " + "-" * 50)
+                        print(f"\n  Top {top_k} important bytes (Train Set):")
+                        print("    Byte | Mean | Std | Mean |abs||")
+                        print("    " + "-" * 50)
+                        for idx in train_top_indices:
+                            mean_val = train_aggregated[cls_idx]['mean'][idx]
+                            std_val = train_aggregated[cls_idx]['std'][idx]
+                            mean_abs_val = train_mean_abs[idx]
+                            line = f"    byte_{idx:4d} | {mean_val:7.4f} | {std_val:6.4f} | {mean_abs_val:8.4f}"
+                            summary_lines.append(line)
+                            print(line)
+                        
+                        summary_lines.append(f"\n  Top {top_k} important bytes (Test Set):")
+                        summary_lines.append("    Byte | Mean | Std | Mean |abs||")
+                        summary_lines.append("    " + "-" * 50)
+                        print(f"\n  Top {top_k} important bytes (Test Set):")
+                        print("    Byte | Mean | Std | Mean |abs||")
+                        print("    " + "-" * 50)
+                        for idx in test_top_indices:
+                            mean_val = test_aggregated[cls_idx]['mean'][idx]
+                            std_val = test_aggregated[cls_idx]['std'][idx]
+                            mean_abs_val = test_mean_abs[idx]
+                            line = f"    byte_{idx:4d} | {mean_val:7.4f} | {std_val:6.4f} | {mean_abs_val:8.4f}"
+                            summary_lines.append(line)
+                            print(line)
+                        
+                        # Compare train vs test top features
+                        train_top_set = set(train_top_indices[:10])
+                        test_top_set = set(test_top_indices[:10])
+                        overlap = train_top_set & test_top_set
+                        overlap_line = f"\n  Top 10 feature overlap (Train ∩ Test): {len(overlap)}/10"
+                        summary_lines.append(overlap_line)
+                        print(overlap_line)
+                        if overlap:
+                            overlap_bytes = f"    Overlapping bytes: {sorted(overlap)}"
+                            summary_lines.append(overlap_bytes)
+                            print(overlap_bytes)
+                    
+                    # Compare explainers: find common top features across methods
+                    if len(explainers) > 1:
+                        summary_lines.append(f"\n  Cross-Method Comparison:")
+                        print(f"\n  Cross-Method Comparison:")
+                        for cls_idx, class_name in enumerate(class_names):
+                            all_top_features = {}
+                            for exp_name in explainers.keys():
+                                agg = all_test_aggregated[exp_name]
+                                mean_abs = agg[cls_idx]['mean_abs']
+                                top_10 = set(np.argsort(mean_abs)[-10:][::-1])
+                                all_top_features[exp_name] = top_10
+                            
+                            # Find intersection of top features across all methods
+                            common_features = set.intersection(*all_top_features.values()) if all_top_features else set()
+                            summary_lines.append(f"    {class_name} - Common top 10 features across all methods: {len(common_features)}")
+                            print(f"    {class_name} - Common top 10 features across all methods: {len(common_features)}")
+                            if common_features:
+                                summary_lines.append(f"      Common bytes: {sorted(common_features)}")
+                                print(f"      Common bytes: {sorted(common_features)}")
+                
+                summary_lines.append("\n" + "=" * 70)
+                summary_lines.append(" GLOBAL FEATURE EXPLANATIONS COMPLETE")
+                summary_lines.append("=" * 70)
+                
+                # Write summary to file
+                summary_path = os.path.join(model_path, 'global_feature_importance_summary.txt')
+                with open(summary_path, 'w') as f:
+                    f.write('\n'.join(summary_lines))
+                print(f"\nGlobal feature importance summary saved to: {summary_path}")
+                
+                print("\n" + "=" * 70)
+                print(" GLOBAL FEATURE EXPLANATIONS COMPLETE")
+                print("=" * 70 + "\n")
         else:
             print("\nSkipping feature explanations (robust_interpret not available)")
 
