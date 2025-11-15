@@ -454,6 +454,7 @@ def load_flow_train_test_split(
     undersample_ratio: float = 0.1,
     undersample_strategy: str = "random",
     max_rows_per_file: Optional[int] = None,
+    root_override: Optional[str] = None,
 ):
     """
     Load a previously saved flow-based train/test split manifest and return
@@ -463,22 +464,97 @@ def load_flow_train_test_split(
         max_rows_per_file: If set, limit the number of rows taken from each file
                           (applies to both train and test). This is useful for
                           running on a subset of the data for faster iteration.
+        root_override: If provided, use this root path instead of the one in the manifest.
+                      Useful when running on a different system where the original absolute
+                      path doesn't exist. If the manifest root doesn't exist and this is
+                      not provided, will try to resolve relative to the manifest file.
     """
     with open(split_manifest_path, "r") as f:
         manifest = json.load(f)
 
     root = manifest["root"]
+    
+    # Handle path resolution for cross-system compatibility
+    if root_override is not None:
+        root = root_override
+    elif not os.path.exists(root):
+        # If the manifest root doesn't exist, try to resolve relative to manifest file
+        manifest_dir = os.path.dirname(os.path.abspath(split_manifest_path))
+        # The manifest is typically in <root>/splits/, so go up one level
+        potential_root = os.path.dirname(manifest_dir)
+        if os.path.exists(potential_root):
+            root = potential_root
+            print(f"Manifest root path '{manifest['root']}' not found. Using '{root}' (resolved from manifest location).")
+        else:
+            raise FileNotFoundError(
+                f"Root path from manifest '{manifest['root']}' does not exist, and could not "
+                f"resolve from manifest location. Please provide --root argument to override."
+            )
     flow_suffix = manifest.get("flow_suffix", ".flow.npy")
-    train_per = {int(k): list(map(int, v)) for k, v in manifest["train_per_file_rows"].items()}
-    test_per = {int(k): list(map(int, v)) for k, v in manifest["test_per_file_rows"].items()}
+    
+    # Create base dataset first to get current file ordering
+    base = FlowAwareDeepPacketDataset(root, flow_suffix=flow_suffix, weight_method=weight_method)
+    
+    # Build mapping from manifest file paths to current file indices
+    # Handle both absolute and relative paths, and normalize for comparison
+    manifest_files = manifest.get("files", [])
+    old_to_new_idx = {}
+    
+    # Normalize paths for comparison (handle absolute vs relative, different roots)
+    # Match by (class, filename) tuple since paths may differ but files are the same
+    def normalize_path(p):
+        # Get just the filename and class directory name
+        filename = os.path.basename(p)
+        # Extract class from path - it's the directory containing the file
+        dirname = os.path.dirname(p)
+        class_name = os.path.basename(dirname)
+        # Handle both absolute and relative paths
+        if not class_name or class_name not in base.classes:
+            # Try to find class in path components
+            parts = p.replace(os.sep, '/').split('/')
+            for part in reversed(parts[:-1]):  # All parts except filename
+                if part in base.classes:
+                    class_name = part
+                    break
+        if class_name in base.classes:
+            return (class_name, filename)
+        return None
+    
+    # Build mapping from normalized paths to current indices
+    current_file_map = {}
+    for new_idx, (path, _) in enumerate(base.files):
+        norm = normalize_path(path)
+        if norm:
+            current_file_map[norm] = new_idx
+    
+    # Map old indices to new indices based on file paths
+    for old_idx, old_path in enumerate(manifest_files):
+        norm = normalize_path(old_path)
+        if norm and norm in current_file_map:
+            new_idx = current_file_map[norm]
+            old_to_new_idx[old_idx] = new_idx
+    
+    # Remap train_per and test_per from old indices to new indices
+    train_per_old = {int(k): list(map(int, v)) for k, v in manifest["train_per_file_rows"].items()}
+    test_per_old = {int(k): list(map(int, v)) for k, v in manifest["test_per_file_rows"].items()}
+    
+    train_per = {}
+    test_per = {}
+    for old_idx, new_idx in old_to_new_idx.items():
+        if old_idx in train_per_old:
+            train_per[new_idx] = train_per_old[old_idx]
+        if old_idx in test_per_old:
+            test_per[new_idx] = test_per_old[old_idx]
     
     # Apply max_rows_per_file limit if specified
     if max_rows_per_file is not None and max_rows_per_file > 0:
         train_per = {fidx: rows[:max_rows_per_file] for fidx, rows in train_per.items()}
         test_per = {fidx: rows[:max_rows_per_file] for fidx, rows in test_per.items()}
         print(f"Limited to {max_rows_per_file} rows per file (subsetting for faster iteration)")
-
-    base = FlowAwareDeepPacketDataset(root, flow_suffix=flow_suffix, weight_method=weight_method)
+    
+    files_not_found = len(manifest_files) - len(old_to_new_idx)
+    if files_not_found > 0:
+        print(f"Warning: {files_not_found} files from manifest were not found in current dataset (may be due to different file ordering or missing files).")
     train_ds = SelectedRowsDeepPacketDataset(base, train_per, weight_method=weight_method)
     original_train_total = len(train_ds)
     original_train_counts = dict(train_ds.class_counts)

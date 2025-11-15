@@ -893,7 +893,11 @@ class gsenn_wrapper(explainer_wrapper):
                 attributions = attrib_mat[:, :, class_idx].cpu().numpy()
             else:
                 # Multiple classes - need to handle appropriately
-                attributions = attrib_mat.gather(2, y.view(-1, 1, 1).expand(-1, natt, nclass))[:, :, 0].cpu().numpy()
+                # y has shape (nx,) - one class per sample
+                # We need to gather attrib_mat[i, :, y[i]] for each sample i
+                # gather expects indices of shape (nx, natt, 1) where each element is the class index
+                y_indices = y.view(-1, 1, 1).expand(-1, natt, 1)  # (nx, natt, 1)
+                attributions = attrib_mat.gather(2, y_indices).squeeze(-1).cpu().numpy()
 
 
         if self.skip_bias and getattr(self.net.conceptizer, "add_bias", None):

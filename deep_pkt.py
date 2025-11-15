@@ -85,15 +85,38 @@ def generate_dir_names(dataset: str, args: TrainArgs, make: bool = True) -> Tupl
 
 def build_args() -> TrainArgs:
     """Build training arguments from command line."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="proc_pcaps/", help="DeepPacket root with class folders of .npy files")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--cuda", action="store_true")
-    parser.add_argument("--theta_reg_lambda", type=float, default=1e-2)
-    parser.add_argument("--theta_reg_type", type=str, default="grad3", choices=["unreg", "none", "grad1", "grad2", "grad3"])
-    parser.add_argument("--seed", type=int, default=2018)
+    parser = argparse.ArgumentParser(
+        description="DeepPacket training and evaluation script with GSENN model support.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Basic training with default settings:\n"
+            "  python deep_pkt.py --root proc_pcaps/ --epochs 10 --cuda\n\n"
+            "  # Training with flow-based split:\n"
+            "  python deep_pkt.py --root proc_pcaps/ --flow_split --epochs 20 --cuda\n\n"
+            "  # Training with class imbalance handling:\n"
+            "  python deep_pkt.py --root proc_pcaps/ --handle_imbalance --undersample --cuda\n\n"
+            "  # Training with feature explanations:\n"
+            "  python deep_pkt.py --root proc_pcaps/ --use_shap --use_lime --cuda"
+        )
+    )
+    parser.add_argument("--root", type=str, default="proc_pcaps/", 
+                        help="DeepPacket root directory with class folders containing .npy files")
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="Number of training epochs (default: 1)")
+    parser.add_argument("--batch_size", type=int, default=128,
+                        help="Batch size for training and evaluation (default: 128)")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate for optimizer (default: 1e-3)")
+    parser.add_argument("--cuda", action="store_true",
+                        help="Use CUDA (GPU) if available (default: False, uses CPU)")
+    parser.add_argument("--theta_reg_lambda", type=float, default=1e-2,
+                        help="Regularization strength for theta (concept parameters) (default: 1e-2)")
+    parser.add_argument("--theta_reg_type", type=str, default="grad3", 
+                        choices=["unreg", "none", "grad1", "grad2", "grad3"],
+                        help="Type of gradient penalty regularization: unreg/none (no regularization), grad1/grad2/grad3 (gradient penalty order) (default: grad3)")
+    parser.add_argument("--seed", type=int, default=2018,
+                        help="Random seed for reproducibility (default: 2018)")
     parser.add_argument("--limit_files_per_split", type=int, default=0,
                         help="Max files per split (train/val/test). Set small to speed up.")
     parser.add_argument("--max_rows_per_file", type=int, default=None,
@@ -110,7 +133,7 @@ def build_args() -> TrainArgs:
     parser.add_argument("--undersample", action="store_true",
                         help="Enable mild undersampling to reduce class imbalance.")
     parser.add_argument("--undersample_ratio", type=float, default=0.1,
-                        help="Ratio of samples to keep from majority classes (0.1 = keep 10% of largest class).")
+                        help="Ratio of samples to keep from majority classes (0.1 = keep 10%% of largest class).")
     parser.add_argument("--undersample_strategy", type=str, default="random",
                         choices=["random", "stratified"],
                         help="Undersampling strategy: random or stratified.")
@@ -125,6 +148,10 @@ def build_args() -> TrainArgs:
         help="Create and save a new flow-based train/test split before training, then use it.")
     parser.add_argument("--flow_test_size", type=float, default=0.2,
         help="Test size for creating a new flow-based split when --save_flow_split is set.")
+    parser.add_argument("--use_shap", action="store_true", default=False,
+        help="Enable SHAP explanations (requires shap package). Disabled by default.")
+    parser.add_argument("--use_lime", action="store_true", default=False,
+        help="Enable LIME explanations (requires lime package). Disabled by default.")
 
     args_ns = parser.parse_args()
 
@@ -161,6 +188,8 @@ def build_args() -> TrainArgs:
     args.use_flow_split_manifest = args_ns.use_flow_split_manifest  # type: ignore[attr-defined]
     args.save_flow_split = args_ns.save_flow_split  # type: ignore[attr-defined]
     args.flow_test_size = args_ns.flow_test_size  # type: ignore[attr-defined]
+    args.use_shap = args_ns.use_shap  # type: ignore[attr-defined]
+    args.use_lime = args_ns.use_lime  # type: ignore[attr-defined]
     return args
 
 def print_full_config(args, model=None):
@@ -249,6 +278,7 @@ def main():
             undersample_ratio=args.undersample_ratio,
             undersample_strategy=args.undersample_strategy,
             max_rows_per_file=args.max_rows_per_file,
+            root_override=args.root,  # Allow overriding manifest root for cross-system compatibility
         )
         valid_loader = None
     else:
@@ -381,8 +411,16 @@ def main():
             print("\n" + "=" * 70)
             print(" GENERATING GLOBAL FEATURE EXPLANATIONS")
             print("=" * 70)
+            use_shap_flag = getattr(args, 'use_shap', False)
+            use_lime_flag = getattr(args, 'use_lime', False)
+            enabled_methods = ["GSENN"]
+            if HAS_SHAP and use_shap_flag:
+                enabled_methods.append("SHAP")
+            if HAS_LIME and use_lime_flag:
+                enabled_methods.append("LIME")
             print("INFO: Processing samples in small batches to control memory usage.")
-            print("      Total samples per class: GSENN=1000, SHAP=200, LIME=200")
+            print(f"      Enabled methods: {', '.join(enabled_methods)}")
+            print("      Total samples per class: GSENN=100, SHAP=50, LIME=50")
             print("=" * 70 + "\n")
             
             # Create feature names for packet bytes (0-1499)
@@ -449,8 +487,14 @@ def main():
                 verbose=False
             )
             
-            # SHAP explainer (if available) - MEMORY OPTIMIZED
-            has_shap_local = HAS_SHAP
+            # SHAP explainer (if available and enabled) - MEMORY OPTIMIZED
+            use_shap_flag = getattr(args, 'use_shap', False)
+            has_shap_local = HAS_SHAP and use_shap_flag
+            if not has_shap_local:
+                if not use_shap_flag:
+                    print("Skipping SHAP explanations (disabled by default, use --use_shap to enable)")
+                elif not HAS_SHAP:
+                    print("Skipping SHAP explanations (shap package not available)")
             if has_shap_local:
                 print("Creating SHAP explainer (MEMORY-OPTIMIZED: small background set)...")
                 try:
@@ -484,8 +528,14 @@ def main():
                         del explainers['SHAP']
                     gc.collect()
             
-            # LIME explainer (if available) - MEMORY OPTIMIZED
-            has_lime_local = HAS_LIME
+            # LIME explainer (if available and enabled) - MEMORY OPTIMIZED
+            use_lime_flag = getattr(args, 'use_lime', False)
+            has_lime_local = HAS_LIME and use_lime_flag
+            if not has_lime_local:
+                if not use_lime_flag:
+                    print("Skipping LIME explanations (disabled by default, use --use_lime to enable)")
+                elif not HAS_LIME:
+                    print("Skipping LIME explanations (lime package not available)")
             if has_lime_local:
                 print("Creating LIME explainer (MEMORY-OPTIMIZED: limited training data)...")
                 try:
@@ -829,8 +879,8 @@ def main():
                         
                         batch_count += 1
                         
-                        # Print progress every 5 batches (more frequent for slower methods)
-                        if (batch_idx + 1) % 5 == 0:
+                        # Print progress every 100 batches (more frequent for slower methods)
+                        if (batch_idx + 1) % 100 == 0:
                             total_collected = sum(samples_processed.values())
                             print(f"    Processed {batch_idx + 1} batches, collected {total_collected} explanations")
                 
