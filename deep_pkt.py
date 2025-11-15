@@ -14,9 +14,29 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix, classification_report
+import warnings
+
+# Optional imports for plotting and metrics (may not be available on HPC clusters)
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    warnings.warn("matplotlib not available. Plotting will be disabled.", UserWarning)
+
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    HAS_SEABORN = False
+    warnings.warn("seaborn not available. Some plots may be disabled.", UserWarning)
+
+try:
+    from sklearn.metrics import confusion_matrix, classification_report
+    HAS_SKLEARN_METRICS = True
+except ImportError:
+    HAS_SKLEARN_METRICS = False
+    warnings.warn("sklearn.metrics not available. Confusion matrix and classification report will be skipped.", UserWarning)
 
 # Import from refactored modules
 from deeppacket import (
@@ -58,15 +78,16 @@ except ImportError:
     HAS_LIME = False
     print("Warning: LIME not available. LIME explanations will be skipped.")
 
-# Ignore ConvergenceWarning
-import warnings
-from sklearn.exceptions import ConvergenceWarning
-
-warnings.filterwarnings(
-    "ignore",
-    category=ConvergenceWarning,
-    module="sklearn.linear_model._least_angle"
-)
+# Ignore ConvergenceWarning (if sklearn is available)
+try:
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings(
+        "ignore",
+        category=ConvergenceWarning,
+        module="sklearn.linear_model._least_angle"
+    )
+except ImportError:
+    pass  # sklearn not available, skip warning filter
 
 # =========================================================
 # Argument parsing and configuration
@@ -389,40 +410,65 @@ def main():
 
     # Generate and plot confusion matrix on test set
     if test_loader is not None:
-        print("\nGenerating confusion matrix on test set...")
         y_pred, y_true = trainer.predict(test_loader)
         
         # Get all class names and labels (including those with zero predictions)
         class_names = probe.classes
         all_labels = list(range(len(class_names)))
         
-        # Compute confusion matrix with all labels
-        cm = confusion_matrix(y_true, y_pred, labels=all_labels)
-        
-        # Print classification report
-        print("\nClassification Report:")
-        print(classification_report(y_true, y_pred, labels=all_labels, 
-                                   target_names=class_names, zero_division=0))
-        
-        # Plot confusion matrix
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                    xticklabels=class_names, yticklabels=class_names,
-                    cbar_kws={'label': 'Count'})
-        plt.title('Confusion Matrix - Test Set', fontsize=16, pad=20)
-        plt.ylabel('True Label', fontsize=12)
-        plt.xlabel('Predicted Label', fontsize=12)
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        
-        # Save confusion matrix
-        cm_path = os.path.join(model_path, 'confusion_matrix.png')
-        plt.savefig(cm_path, dpi=300, bbox_inches='tight')
-        print(f"Confusion matrix saved to: {cm_path}")
-        
-        # Show plot
-        # plt.show()
+        # Compute and print confusion matrix and classification report if sklearn.metrics is available
+        if HAS_SKLEARN_METRICS:
+            print("\nGenerating confusion matrix on test set...")
+            cm = confusion_matrix(y_true, y_pred, labels=all_labels)
+            
+            # Print classification report
+            print("\nClassification Report:")
+            print(classification_report(y_true, y_pred, labels=all_labels, 
+                                       target_names=class_names, zero_division=0))
+            
+            # Plot confusion matrix if matplotlib and seaborn are available
+            if HAS_MATPLOTLIB and HAS_SEABORN:
+                plt.figure(figsize=(12, 10))
+                sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                            xticklabels=class_names, yticklabels=class_names,
+                            cbar_kws={'label': 'Count'})
+                plt.title('Confusion Matrix - Test Set', fontsize=16, pad=20)
+                plt.ylabel('True Label', fontsize=12)
+                plt.xlabel('Predicted Label', fontsize=12)
+                plt.xticks(rotation=45, ha='right')
+                plt.yticks(rotation=0)
+                plt.tight_layout()
+                
+                # Save confusion matrix
+                cm_path = os.path.join(model_path, 'confusion_matrix.png')
+                plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+                print(f"Confusion matrix saved to: {cm_path}")
+                # plt.show()
+            elif HAS_MATPLOTLIB:
+                # Fallback: use matplotlib only (no seaborn)
+                plt.figure(figsize=(12, 10))
+                plt.imshow(cm, interpolation='nearest', cmap='Blues')
+                plt.title('Confusion Matrix - Test Set', fontsize=16, pad=20)
+                plt.ylabel('True Label', fontsize=12)
+                plt.xlabel('Predicted Label', fontsize=12)
+                plt.colorbar(label='Count')
+                plt.xticks(range(len(class_names)), class_names, rotation=45, ha='right')
+                plt.yticks(range(len(class_names)), class_names)
+                # Add text annotations
+                for i in range(len(class_names)):
+                    for j in range(len(class_names)):
+                        plt.text(j, i, str(cm[i, j]), ha='center', va='center')
+                plt.tight_layout()
+                
+                cm_path = os.path.join(model_path, 'confusion_matrix.png')
+                plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+                print(f"Confusion matrix saved to: {cm_path}")
+            else:
+                print("Warning: matplotlib not available. Skipping confusion matrix plot.")
+                print("Confusion matrix values (raw):")
+                print(cm)
+        else:
+            print("\nWarning: sklearn.metrics not available. Skipping confusion matrix and classification report.")
         
         # Generate global feature explanations (aggregated per class)
         if HAS_ROBUST_INTERPRET:
@@ -1035,85 +1081,89 @@ def main():
                     )
                 
                 # Visualize global feature importance per class for all explainers
-                print("\n" + "=" * 70)
-                print("Generating global feature importance visualizations...")
-                print("=" * 70)
-                
-                n_classes = len(class_names)
-                n_explainers = len(explainers)
-                
-                # Create plots for each explainer
-                for explainer_name in explainers.keys():
-                    train_aggregated = all_train_aggregated[explainer_name]
-                    test_aggregated = all_test_aggregated[explainer_name]
+                if HAS_MATPLOTLIB:
+                    print("\n" + "=" * 70)
+                    print("Generating global feature importance visualizations...")
+                    print("=" * 70)
                     
-                    # Plot 1: Train set
-                    fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
-                    if n_classes == 1:
-                        axes = [axes]
+                    n_classes = len(class_names)
+                    n_explainers = len(explainers)
                     
-                    for cls_idx, class_name in enumerate(class_names):
-                        ax = axes[cls_idx]
-                        mean_abs = train_aggregated[cls_idx]['mean_abs']
+                    # Create plots for each explainer
+                    for explainer_name in explainers.keys():
+                        train_aggregated = all_train_aggregated[explainer_name]
+                        test_aggregated = all_test_aggregated[explainer_name]
                         
-                        # Get top K features
-                        top_k = min(50, len(mean_abs))
-                        top_indices = np.argsort(mean_abs)[-top_k:][::-1]
-                        top_values = train_aggregated[cls_idx]['mean'][top_indices]
+                        # Plot 1: Train set
+                        fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
+                        if n_classes == 1:
+                            axes = [axes]
                         
-                        # Plot with color coding (positive/negative)
-                        colors = ['red' if v > 0 else 'blue' for v in top_values]
-                        ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
-                        ax.set_yticks(range(len(top_indices)))
-                        ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
-                        ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
-                        ax.set_title(
-                            f"Train Set - {class_name} ({explainer_name}) (n={train_aggregated[cls_idx]['count']} samples, "
-                            f"top {top_k} features by |mean|)",
-                            fontsize=11, fontweight='bold'
-                        )
-                        ax.grid(axis='x', alpha=0.3)
-                        ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
-                    
-                    plt.tight_layout()
-                    train_expl_path = os.path.join(model_path, f'global_feature_importance_train_{explainer_name}.png')
-                    plt.savefig(train_expl_path, dpi=300, bbox_inches='tight')
-                    print(f"Train set global feature importance ({explainer_name}) saved to: {train_expl_path}")
-                    # plt.show()
-                    
-                    # Plot 2: Test set
-                    fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
-                    if n_classes == 1:
-                        axes = [axes]
-                    
-                    for cls_idx, class_name in enumerate(class_names):
-                        ax = axes[cls_idx]
-                        mean_abs = test_aggregated[cls_idx]['mean_abs']
+                        for cls_idx, class_name in enumerate(class_names):
+                            ax = axes[cls_idx]
+                            mean_abs = train_aggregated[cls_idx]['mean_abs']
+                            
+                            # Get top K features
+                            top_k = min(50, len(mean_abs))
+                            top_indices = np.argsort(mean_abs)[-top_k:][::-1]
+                            top_values = train_aggregated[cls_idx]['mean'][top_indices]
+                            
+                            # Plot with color coding (positive/negative)
+                            colors = ['red' if v > 0 else 'blue' for v in top_values]
+                            ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
+                            ax.set_yticks(range(len(top_indices)))
+                            ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
+                            ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
+                            ax.set_title(
+                                f"Train Set - {class_name} ({explainer_name}) (n={train_aggregated[cls_idx]['count']} samples, "
+                                f"top {top_k} features by |mean|)",
+                                fontsize=11, fontweight='bold'
+                            )
+                            ax.grid(axis='x', alpha=0.3)
+                            ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
                         
-                        # Get top K features
-                        top_k = min(50, len(mean_abs))
-                        top_indices = np.argsort(mean_abs)[-top_k:][::-1]
-                        top_values = test_aggregated[cls_idx]['mean'][top_indices]
+                        plt.tight_layout()
+                        train_expl_path = os.path.join(model_path, f'global_feature_importance_train_{explainer_name}.png')
+                        plt.savefig(train_expl_path, dpi=300, bbox_inches='tight')
+                        print(f"Train set global feature importance ({explainer_name}) saved to: {train_expl_path}")
+                        # plt.show()
                         
-                        # Plot with color coding (positive/negative)
-                        colors = ['red' if v > 0 else 'blue' for v in top_values]
-                        ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
-                        ax.set_yticks(range(len(top_indices)))
-                        ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
-                        ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
-                        ax.set_title(
-                            f"Test Set - {class_name} ({explainer_name}) (n={test_aggregated[cls_idx]['count']} samples, "
-                            f"top {top_k} features by |mean|)",
-                            fontsize=11, fontweight='bold'
-                        )
-                        ax.grid(axis='x', alpha=0.3)
-                        ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
-                    
-                    plt.tight_layout()
-                    test_expl_path = os.path.join(model_path, f'global_feature_importance_test_{explainer_name}.png')
-                    plt.savefig(test_expl_path, dpi=300, bbox_inches='tight')
-                    print(f"Test set global feature importance ({explainer_name}) saved to: {test_expl_path}")
-                    # plt.show()
+                        # Plot 2: Test set
+                        fig, axes = plt.subplots(n_classes, 1, figsize=(16, 4 * n_classes))
+                        if n_classes == 1:
+                            axes = [axes]
+                        
+                        for cls_idx, class_name in enumerate(class_names):
+                            ax = axes[cls_idx]
+                            mean_abs = test_aggregated[cls_idx]['mean_abs']
+                            
+                            # Get top K features
+                            top_k = min(50, len(mean_abs))
+                            top_indices = np.argsort(mean_abs)[-top_k:][::-1]
+                            top_values = test_aggregated[cls_idx]['mean'][top_indices]
+                            
+                            # Plot with color coding (positive/negative)
+                            colors = ['red' if v > 0 else 'blue' for v in top_values]
+                            ax.barh(range(len(top_indices)), top_values, color=colors, alpha=0.7)
+                            ax.set_yticks(range(len(top_indices)))
+                            ax.set_yticklabels([f"byte_{top_indices[i]}" for i in range(len(top_indices))], fontsize=8)
+                            ax.set_xlabel(f'Mean Feature Importance ({explainer_name})', fontsize=10)
+                            ax.set_title(
+                                f"Test Set - {class_name} ({explainer_name}) (n={test_aggregated[cls_idx]['count']} samples, "
+                                f"top {top_k} features by |mean|)",
+                                fontsize=11, fontweight='bold'
+                            )
+                            ax.grid(axis='x', alpha=0.3)
+                            ax.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+                        
+                        plt.tight_layout()
+                        test_expl_path = os.path.join(model_path, f'global_feature_importance_test_{explainer_name}.png')
+                        plt.savefig(test_expl_path, dpi=300, bbox_inches='tight')
+                        print(f"Test set global feature importance ({explainer_name}) saved to: {test_expl_path}")
+                        # plt.show()
+                else:
+                    print("\nWarning: matplotlib not available. Skipping global feature importance visualizations.")
+                    print("Feature importance statistics are still available in the summary file.")
                 
                 # Print summary statistics per class and write to file for all explainers
                 summary_lines = []
