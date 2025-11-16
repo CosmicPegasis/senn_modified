@@ -3,10 +3,14 @@
 import os
 import glob
 import bisect
+import logging
 from typing import Optional, Tuple, Dict, List
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 def _paired_flow_path(data_path: str, flow_suffix: str = ".flow.npy") -> str:
@@ -14,6 +18,22 @@ def _paired_flow_path(data_path: str, flow_suffix: str = ".flow.npy") -> str:
     if data_path.endswith(".npy"):
         return data_path[:-4] + flow_suffix
     return data_path + flow_suffix
+
+
+def get_dataset_classes(root: str) -> List[str]:
+    """
+    Get class names from dataset root directory without loading any data.
+    
+    Args:
+        root: Root directory containing class subdirectories
+        
+    Returns:
+        Sorted list of class names
+    """
+    exclude_dirs = {'splits', 'train', 'test', '__pycache__', '.git'}
+    classes = sorted([d for d in os.listdir(root) 
+                     if os.path.isdir(os.path.join(root, d)) and d not in exclude_dirs])
+    return classes
 
 
 def _normalize_packet_vector(vec: np.ndarray) -> np.ndarray:
@@ -74,7 +94,10 @@ class DeepPacketNPYDataset(Dataset):
     def __init__(self, root: str, split_indices: Optional[List[int]] = None, 
                  max_rows_per_file: Optional[int] = None, weight_method: str = "balanced"):
         self.root = root
-        self.classes = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+        # Filter out common non-class directories
+        exclude_dirs = {'splits', 'train', 'test', '__pycache__', '.git'}
+        self.classes = sorted([d for d in os.listdir(root) 
+                              if os.path.isdir(os.path.join(root, d)) and d not in exclude_dirs])
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
         self.files: List[Tuple[str, int]] = []
         
@@ -92,18 +115,26 @@ class DeepPacketNPYDataset(Dataset):
         if not self.files:
             raise RuntimeError(f"No .npy files found under {root}")
 
-        # Count rows in each file (using lazy memmap - doesn't load data into memory)
+        # Load all data files into RAM (no memmap - faster access)
         self.counts: List[int] = []
-        for path, _ in self.files:
-            # Use memmap mode to avoid loading entire file into memory
-            # This is lazy - only reads file header to get shape
-            arr = np.load(path, mmap_mode="r")
+        self._data_arrays: List[np.ndarray] = []  # Store loaded arrays in RAM
+        
+        pbar = tqdm(self.files, desc="Loading files", ncols=120)
+        for i, (path, _) in enumerate(pbar):
+            pbar.set_postfix(file=os.path.basename(path))
+            logger.debug(f"Loading file {i+1}/{len(self.files)}: {os.path.basename(path)}")
+            # Load entire file into RAM (no memmap)
+            arr = np.load(path, mmap_mode=None)  # mmap_mode=None loads into RAM
+            # Apply max_rows_per_file limit if specified (and > 0)
+            if max_rows_per_file is not None and max_rows_per_file > 0 and arr.ndim > 1:
+                arr = arr[:max_rows_per_file]
+            elif max_rows_per_file is not None and max_rows_per_file > 0 and arr.ndim == 1:
+                # For 1D arrays, we can't slice, so we just keep it as is
+                pass
+            
             nrows = 1 if arr.ndim == 1 else int(arr.shape[0])
-            if max_rows_per_file is not None:
-                nrows = min(nrows, max_rows_per_file)
             self.counts.append(nrows)
-            # Note: arr reference is dropped here, but memmap handle stays open
-            # This is fine - memmap is lazy and doesn't consume memory until accessed
+            self._data_arrays.append(arr)  # Store in RAM
         
         self.offsets = np.cumsum([0] + self.counts)
         self.total = int(self.offsets[-1])
@@ -113,9 +144,6 @@ class DeepPacketNPYDataset(Dataset):
         # Calculate class distribution for imbalance handling
         self.class_counts = self._calculate_class_counts()
         self.class_weights = self._calculate_class_weights(method=weight_method)
-        
-        # Cache memmap arrays to avoid repeated file opening
-        self._memmaps = {}
 
     def __len__(self) -> int:
         return self.total
@@ -226,20 +254,24 @@ class DeepPacketNPYDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get a sample from the dataset."""
+        logger.debug(f"    __getitem__[{idx}]: Starting")
         fidx, ridx = self._locate(idx)
         path, y = self.files[fidx]
+        logger.debug(f"    __getitem__[{idx}]: Located file {fidx}, row {ridx}, path: {os.path.basename(path)}")
         
-        # Cache memmap arrays to avoid repeated file opening (major performance improvement)
-        if fidx not in self._memmaps:
-            self._memmaps[fidx] = np.load(path, mmap_mode="r")
-        arr = self._memmaps[fidx]
+        # Access data directly from RAM (no file I/O needed)
+        arr = self._data_arrays[fidx]
         
+        logger.debug(f"    __getitem__[{idx}]: Extracting vector from RAM")
         vec = arr if arr.ndim == 1 else arr[ridx]
+        logger.debug(f"    __getitem__[{idx}]: Normalizing vector")
         vec = _normalize_packet_vector(vec)
         # Use torch.from_numpy for zero-copy when array is already contiguous float32
         # _normalize_packet_vector ensures vec is contiguous float32
+        logger.debug(f"    __getitem__[{idx}]: Converting to tensor")
         x = torch.from_numpy(vec).view(1, 1, -1)
         # For scalar labels, use as_tensor for efficiency
+        logger.debug(f"    __getitem__[{idx}]: Complete, returning tensor shape {x.shape}")
         return x, torch.as_tensor(y, dtype=torch.long)
 
 
@@ -312,8 +344,15 @@ class UndersampledDeepPacketNPYDataset(Dataset):
         self.class_counts = self._calculate_class_counts()
         self.class_weights = self._calculate_class_weights()
         
-        # Cache memmap arrays to avoid repeated file opening
-        self._memmaps = {}
+        # Load all data files into RAM (no memmap - faster access)
+        self._data_arrays: List[np.ndarray] = []
+        pbar = tqdm(self.files, desc="Loading files", ncols=120)
+        for i, (path, _) in enumerate(pbar):
+            pbar.set_postfix(file=os.path.basename(path))
+            logger.debug(f"Loading file {i+1}/{len(self.files)}: {os.path.basename(path)}")
+            # Load entire file into RAM (no memmap)
+            arr = np.load(path, mmap_mode=None)  # mmap_mode=None loads into RAM
+            self._data_arrays.append(arr)
     
     def __len__(self) -> int:
         return self.total
@@ -375,16 +414,16 @@ class UndersampledDeepPacketNPYDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get a sample from the undersampled dataset."""
+        logger.debug(f"    Undersampled.__getitem__[{idx}]: Starting")
         fidx, ridx = self._locate(idx)
         path, y = self.files[fidx]
         
         # Get the actual row index from the sampling indices
         actual_row = self.sampling_indices[fidx][ridx]
+        logger.debug(f"    Undersampled.__getitem__[{idx}]: Located file {fidx}, row {ridx} -> actual_row {actual_row}")
         
-        # Cache memmap arrays to avoid repeated file opening (major performance improvement)
-        if fidx not in self._memmaps:
-            self._memmaps[fidx] = np.load(path, mmap_mode="r")
-        arr = self._memmaps[fidx]
+        # Access data directly from RAM (no file I/O needed)
+        arr = self._data_arrays[fidx]
         
         vec = arr if arr.ndim == 1 else arr[actual_row]
         vec = _normalize_packet_vector(vec)
@@ -392,6 +431,7 @@ class UndersampledDeepPacketNPYDataset(Dataset):
         # _normalize_packet_vector ensures vec is contiguous float32
         x = torch.from_numpy(vec).view(1, 1, -1)
         # For scalar labels, use as_tensor for efficiency
+        logger.debug(f"    Undersampled.__getitem__[{idx}]: Complete")
         return x, torch.as_tensor(y, dtype=torch.long)
 
 
@@ -405,24 +445,26 @@ class FlowAwareDeepPacketDataset(DeepPacketNPYDataset):
         super().__init__(*args, **kwargs)
         self.flow_suffix = flow_suffix
         self._flow_paths = []
-        self._flow_memmaps = []
-        for path, _ in self.files:
+        # Load all flow files into RAM (no memmap - faster access)
+        self._flow_arrays: List[Optional[np.ndarray]] = []
+        pbar = tqdm(self.files, desc="Loading flow files", ncols=120)
+        for i, (path, _) in enumerate(pbar):
             fpath = _paired_flow_path(path, flow_suffix=self.flow_suffix)
             self._flow_paths.append(fpath if os.path.exists(fpath) else None)
-            self._flow_memmaps.append(None)  # lazy-init
+            if fpath and os.path.exists(fpath):
+                pbar.set_postfix(file=os.path.basename(fpath))
+                logger.debug(f"Loading flow file {i+1}/{len(self.files)}: {os.path.basename(fpath)}")
+                flow_arr = np.load(fpath, mmap_mode=None)  # Load into RAM
+                if flow_arr.dtype != np.uint64:
+                    flow_arr = flow_arr.astype(np.uint64, copy=False)
+                self._flow_arrays.append(flow_arr)
+            else:
+                pbar.set_postfix(file=os.path.basename(path))
+                self._flow_arrays.append(None)
 
     def _ensure_flow_mm(self, file_idx: int):
-        """Lazily load flow memmap for a file."""
-        fpath = self._flow_paths[file_idx]
-        if fpath is None:
-            return None
-        mm = self._flow_memmaps[file_idx]
-        if mm is None:
-            mm = np.load(fpath, mmap_mode="r")
-            if mm.dtype != np.uint64:
-                mm = mm.astype(np.uint64, copy=False)
-            self._flow_memmaps[file_idx] = mm
-        return mm
+        """Get flow array from RAM (already loaded in __init__)."""
+        return self._flow_arrays[file_idx]
 
     def flow_id_at(self, global_idx: int) -> int:
         """Get flow ID for a given global index."""
@@ -459,8 +501,20 @@ class SelectedRowsDeepPacketDataset(Dataset):
         self.class_counts = self._calculate_class_counts()
         self.class_weights = self._calculate_class_weights(method=weight_method)
         
-        # Cache memmap arrays to avoid repeated file opening
-        self._memmaps = {}
+        # Reuse data arrays from base dataset if available (already loaded in RAM)
+        if hasattr(base_ds, '_data_arrays'):
+            logger.info(f"Reusing data arrays from base dataset (already in RAM)")
+            self._data_arrays = base_ds._data_arrays
+        else:
+            # Fallback: load all data files into RAM (no memmap - faster access)
+            self._data_arrays: List[np.ndarray] = []
+            pbar = tqdm(self.files, desc="Loading files", ncols=120)
+            for i, (path, _) in enumerate(pbar):
+                pbar.set_postfix(file=os.path.basename(path))
+                logger.debug(f"Loading file {i+1}/{len(self.files)}: {os.path.basename(path)}")
+                # Load entire file into RAM (no memmap)
+                arr = np.load(path, mmap_mode=None)  # mmap_mode=None loads into RAM
+                self._data_arrays.append(arr)
 
     def __len__(self) -> int:
         return self.total
@@ -574,14 +628,14 @@ class SelectedRowsDeepPacketDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get a sample from the dataset."""
+        logger.debug(f"    SelectedRows.__getitem__[{idx}]: Starting")
         fidx, ridx = self._locate(idx)
         path, y = self.files[fidx]
         actual_row = self.sampling_indices[fidx][ridx]
+        logger.debug(f"    SelectedRows.__getitem__[{idx}]: Located file {fidx}, row {ridx} -> actual_row {actual_row}")
         
-        # Cache memmap arrays to avoid repeated file opening (major performance improvement)
-        if fidx not in self._memmaps:
-            self._memmaps[fidx] = np.load(path, mmap_mode="r")
-        arr = self._memmaps[fidx]
+        # Access data directly from RAM (no file I/O needed)
+        arr = self._data_arrays[fidx]
         
         vec = arr if arr.ndim == 1 else arr[actual_row]
         vec = _normalize_packet_vector(vec)
@@ -589,5 +643,6 @@ class SelectedRowsDeepPacketDataset(Dataset):
         # _normalize_packet_vector ensures vec is contiguous float32
         x = torch.from_numpy(vec).view(1, 1, -1)
         # For scalar labels, use as_tensor for efficiency
+        logger.debug(f"    SelectedRows.__getitem__[{idx}]: Complete")
         return x, torch.as_tensor(y, dtype=torch.long)
 

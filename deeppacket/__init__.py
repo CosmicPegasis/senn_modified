@@ -29,6 +29,7 @@ from .datasets import (
     UndersampledDeepPacketNPYDataset,
     FlowAwareDeepPacketDataset,
     SelectedRowsDeepPacketDataset,
+    get_dataset_classes,
 )
 
 from .flow_utils import (
@@ -36,6 +37,9 @@ from .flow_utils import (
     split_deeppacket,
     save_flow_train_test_split,
     load_flow_train_test_split,
+    create_flow_split_dataset_files,
+    has_pre_split_dataset,
+    load_pre_split_dataset,
     run_comprehensive_flow_checks,
     _assert_no_flow_overlap_datasets,
 )
@@ -64,11 +68,15 @@ __all__ = [
     "UndersampledDeepPacketNPYDataset",
     "FlowAwareDeepPacketDataset",
     "SelectedRowsDeepPacketDataset",
+    "get_dataset_classes",
     # Flow utils
     "split_deeppacket_by_flow",
     "split_deeppacket",
     "save_flow_train_test_split",
     "load_flow_train_test_split",
+    "create_flow_split_dataset_files",
+    "has_pre_split_dataset",
+    "load_pre_split_dataset",
     "run_comprehensive_flow_checks",
     "_assert_no_flow_overlap_datasets",
 ]

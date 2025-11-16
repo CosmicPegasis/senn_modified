@@ -2,12 +2,14 @@
 
 import os
 import time
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
 from .utils import (
     AverageMeter,
@@ -15,6 +17,8 @@ from .utils import (
     multiclass_precision_at_k,
     compute_jacobian_sum,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -84,15 +88,22 @@ class ClassificationTrainer:
 
     def train(self, train_loader, val_loader=None, epochs=1, save_path: Optional[str] = None):
         """Train the model for specified number of epochs."""
+        logger.info(f"Starting training for {epochs} epochs")
+        logger.info(f"  Device: {self.device}")
+        logger.info(f"  Train batches: {len(train_loader)}")
+        logger.info(f"  Val batches: {len(val_loader) if val_loader is not None else 0}")
         best_prec1 = 0.0
         for epoch in range(epochs):
+            logger.info(f"Epoch {epoch+1}/{epochs} - Starting training phase")
             self.train_epoch(epoch, train_loader)
             val_prec1 = 0.0
             if val_loader is not None:
+                logger.info(f"Epoch {epoch+1}/{epochs} - Starting validation phase")
                 val_prec1 = self.validate(val_loader)
             is_best = val_prec1 > best_prec1
             best_prec1 = max(val_prec1, best_prec1)
             if save_path is not None:
+                logger.info(f"Epoch {epoch+1}/{epochs} - Saving checkpoint to {save_path}")
                 state = {
                     "epoch": epoch + 1,
                     "state_dict": self.model.state_dict(),
@@ -102,8 +113,9 @@ class ClassificationTrainer:
                 os.makedirs(save_path, exist_ok=True)
                 torch.save(state, os.path.join(save_path, "checkpoint.pth.tar"))
                 if is_best:
+                    logger.info(f"Epoch {epoch+1}/{epochs} - New best model! Saving best checkpoint.")
                     torch.save(state, os.path.join(save_path, "model_best.pth.tar"))
-        print("Training done")
+        logger.info("Training completed")
 
     def train_batch(self, inputs, targets):
         """Override in subclasses; must return (logits, loss, dict_of_losses)."""
@@ -134,18 +146,32 @@ class ClassificationTrainer:
         self.model.train()
         end = time.time()
         max_batches = int(getattr(self.args, "max_batches_per_epoch", 0) or 0)
+        total_batches = max_batches if max_batches > 0 else len(train_loader)
+        logger.info(f"  Train epoch {epoch}: Processing up to {total_batches} batches")
 
-        for i, (inputs, targets) in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Train Epoch [{epoch}]", ncols=120)
+        for i, (inputs, targets) in enumerate(pbar):
+            batch_start_time = time.time()
+            logger.debug(f"  Batch {i+1}/{len(train_loader)}: Starting batch load")
+            
             data_time.update(time.time() - end)
+            logger.debug(f"  Batch {i+1}: Data load time: {time.time() - end:.4f}s, shape: {inputs.shape}")
 
             # Use non_blocking for async transfer if on GPU, check if already on device
             non_blocking = self.device.type == 'cuda'
             if inputs.device != self.device:
+                logger.debug(f"  Batch {i+1}: Moving inputs to {self.device} (non_blocking={non_blocking})")
                 inputs = inputs.to(self.device, non_blocking=non_blocking)
             if targets.device != self.device:
+                logger.debug(f"  Batch {i+1}: Moving targets to {self.device} (non_blocking={non_blocking})")
                 targets = targets.to(self.device, non_blocking=non_blocking)
-
+            
+            logger.debug(f"  Batch {i+1}: Starting forward/backward pass")
+            forward_start = time.time()
             logits, loss, loss_dict = self.train_batch(inputs, targets)
+            forward_time = time.time() - forward_start
+            logger.debug(f"  Batch {i+1}: Forward/backward pass completed in {forward_time:.4f}s, loss: {loss.item():.4f}")
+            
             loss_dict["iter"] = i + (len(train_loader) * epoch)
             self.loss_history.append(loss_dict)
 
@@ -163,20 +189,25 @@ class ClassificationTrainer:
             top5.update(prec5[0], inputs.size(0))
 
             batch_time.update(time.time() - end)
+            total_batch_time = time.time() - batch_start_time
+            logger.debug(f"  Batch {i+1}: Total batch time: {total_batch_time:.4f}s (data: {data_time.val:.4f}s, compute: {forward_time:.4f}s)")
             end = time.time()
 
-            if i % self.print_freq == 0:
-                print(f"Epoch: [{epoch}][{i}/{len(train_loader)}]  "
-                      f"Time {batch_time.val:.2f} ({batch_time.avg:.2f})  "
-                      f"Loss {losses_meter.val:.4f} ({losses_meter.avg:.4f})  "
-                      f"Prec@1 {top1.val:.3f} ({top1.avg:.3f})  "
-                      f"Prec@5 {top5.val:.3f} ({top5.avg:.3f})")
+            # Update progress bar with current metrics
+            pbar.set_postfix({
+                'Loss': f'{losses_meter.avg:.4f}',
+                'Acc@1': f'{top1.avg:.3f}',
+                'Acc@5': f'{top5.avg:.3f}',
+                'Time': f'{batch_time.avg:.2f}s'
+            })
 
             if max_batches and (i + 1) >= max_batches:
+                logger.info(f"  Reached max_batches limit ({max_batches}), stopping epoch")
                 break
 
     def validate(self, val_loader) -> float:
         """Validate the model."""
+        logger.info(f"  Validation: Processing {len(val_loader)} batches")
         batch_time = AverageMeter()
         losses_meter = AverageMeter()
         top1 = AverageMeter()
@@ -185,17 +216,29 @@ class ClassificationTrainer:
         self.model.eval()
         end = time.time()
         eval_batches = int(getattr(self.args, "eval_batches", 0) or 0)
+        if eval_batches > 0:
+            logger.info(f"  Validation: Limited to {eval_batches} batches")
 
         with torch.no_grad():
-            for i, (inputs, targets) in enumerate(val_loader):
+            pbar = tqdm(val_loader, desc="Test", ncols=120)
+            for i, (inputs, targets) in enumerate(pbar):
+                batch_start_time = time.time()
+                logger.debug(f"  Val batch {i+1}/{len(val_loader)}: Starting batch load")
+                
                 # Use non_blocking for async transfer if on GPU, check if already on device
                 non_blocking = self.device.type == 'cuda'
                 if inputs.device != self.device:
+                    logger.debug(f"  Val batch {i+1}: Moving inputs to {self.device}")
                     inputs = inputs.to(self.device, non_blocking=non_blocking)
                 if targets.device != self.device:
+                    logger.debug(f"  Val batch {i+1}: Moving targets to {self.device}")
                     targets = targets.to(self.device, non_blocking=non_blocking)
 
+                logger.debug(f"  Val batch {i+1}: Starting forward pass")
+                forward_start = time.time()
                 output = self.model(inputs)
+                forward_time = time.time() - forward_start
+                logger.debug(f"  Val batch {i+1}: Forward pass completed in {forward_time:.4f}s")
                 loss = self.prediction_criterion(
                     output, targets if self.nclasses > 2 else targets.float().unsqueeze(1)
                 )
@@ -214,37 +257,55 @@ class ClassificationTrainer:
                 top5.update(prec5[0], inputs.size(0))
 
                 batch_time.update(time.time() - end)
+                total_batch_time = time.time() - batch_start_time
+                logger.debug(f"  Val batch {i+1}: Total batch time: {total_batch_time:.4f}s")
                 end = time.time()
 
-                if i % self.print_freq == 0:
-                    print(f"Test: [{i}/{len(val_loader)}]  Time {batch_time.val:.3f} ({batch_time.avg:.3f})  "
-                          f"Loss {losses_meter.val:.4f} ({losses_meter.avg:.4f})  "
-                          f"Prec@1 {top1.val:.3f} ({top1.avg:.3f})  Prec@5 {top5.val:.3f} ({top5.avg:.3f})")
+                # Update progress bar with current metrics
+                pbar.set_postfix({
+                    'Loss': f'{losses_meter.avg:.4f}',
+                    'Acc@1': f'{top1.avg:.3f}',
+                    'Acc@5': f'{top5.avg:.3f}',
+                    'Time': f'{batch_time.avg:.3f}s'
+                })
 
                 if eval_batches and (i + 1) >= eval_batches:
+                    logger.info(f"  Reached eval_batches limit ({eval_batches}), stopping validation")
                     break
 
-        print(f" * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}")
         return top1.avg
 
     def evaluate(self, test_loader) -> float:
         """Evaluate the model on test set."""
+        logger.info(f"  Evaluation: Processing {len(test_loader)} batches")
         self.model.eval()
         test_loss = 0.0
         correct = 0
         total_seen = 0
         eval_batches = int(getattr(self.args, "eval_batches", 0) or 0)
+        if eval_batches > 0:
+            logger.info(f"  Evaluation: Limited to {eval_batches} batches")
 
         with torch.no_grad():
-            for i, (data, targets) in enumerate(test_loader):
+            pbar = tqdm(test_loader, desc="Evaluation", ncols=120)
+            for i, (data, targets) in enumerate(pbar):
+                batch_start_time = time.time()
+                logger.debug(f"  Eval batch {i+1}/{len(test_loader)}: Starting batch load")
+                
                 # Use non_blocking for async transfer if on GPU, check if already on device
                 non_blocking = self.device.type == 'cuda'
                 if data.device != self.device:
+                    logger.debug(f"  Eval batch {i+1}: Moving data to {self.device}")
                     data = data.to(self.device, non_blocking=non_blocking)
                 if targets.device != self.device:
+                    logger.debug(f"  Eval batch {i+1}: Moving targets to {self.device}")
                     targets = targets.to(self.device, non_blocking=non_blocking)
 
+                logger.debug(f"  Eval batch {i+1}: Starting forward pass")
+                forward_start = time.time()
                 output = self.model(data)
+                forward_time = time.time() - forward_start
+                logger.debug(f"  Eval batch {i+1}: Forward pass completed in {forward_time:.4f}s")
                 loss = self.prediction_criterion(
                     output, targets if self.nclasses > 2 else targets.float().unsqueeze(1)
                 )
@@ -259,12 +320,24 @@ class ClassificationTrainer:
                 correct += pred.eq(targets.view(-1)).sum().item()
                 total_seen += targets.numel()
 
+                total_batch_time = time.time() - batch_start_time
+                logger.debug(f"  Eval batch {i+1}: Total batch time: {total_batch_time:.4f}s")
+                
+                # Update progress bar with current metrics
+                current_acc = 100.0 * correct / max(1, total_seen)
+                current_loss = test_loss / max(1, (i + 1))
+                pbar.set_postfix({
+                    'Loss': f'{current_loss:.4f}',
+                    'Acc': f'{current_acc:.2f}%'
+                })
+                
                 if eval_batches and (i + 1) >= eval_batches:
+                    logger.info(f"  Reached eval_batches limit ({eval_batches}), stopping evaluation")
                     break
 
         test_loss /= max(1, (i + 1))
         acc = 100.0 * correct / max(1, total_seen)
-        print(f"\nEvaluation: Average loss: {test_loss:.4f}, Accuracy: {correct}/{total_seen} ({acc:.0f}%)\n")
+        logger.info(f"  Evaluation complete: Average loss: {test_loss:.4f}, Accuracy: {correct}/{total_seen} ({acc:.0f}%)")
         return acc
 
     def predict(self, test_loader) -> Tuple[np.ndarray, np.ndarray]:
@@ -322,19 +395,28 @@ class GradPenaltyTrainer(ClassificationTrainer):
 
     def train_batch(self, inputs: torch.Tensor, targets: torch.Tensor):
         """Train on a single batch with gradient penalty."""
+        logger.debug("    train_batch: Starting batch processing")
         self.model.train()
         device = self.device
         # Inputs and targets should already be on device from train_epoch
         # Only move if not already on device (defensive check)
         if inputs.device != device:
+            logger.debug(f"    train_batch: Moving inputs to {device}")
             inputs = inputs.to(device, non_blocking=device.type == 'cuda')
         if targets.device != device:
+            logger.debug(f"    train_batch: Moving targets to {device}")
             targets = targets.to(device, non_blocking=device.type == 'cuda')
         # Clone and detach for gradient computation
+        logger.debug("    train_batch: Cloning inputs for gradient computation")
         inputs = inputs.clone().detach().requires_grad_(True)
+        logger.debug("    train_batch: Zeroing gradients")
         self.optimizer.zero_grad()
 
+        logger.debug("    train_batch: Starting forward pass")
+        forward_start = time.time()
         pred = self.model(inputs)
+        forward_time = time.time() - forward_start
+        logger.debug(f"    train_batch: Forward pass completed in {forward_time:.4f}s")
         if self.nclasses <= 2:
             pred_loss = self.prediction_criterion(pred.view(-1, 1), targets.float().view(-1, 1))
         else:
@@ -399,11 +481,22 @@ class GradPenaltyTrainer(ClassificationTrainer):
 
         all_losses["grad_penalty"] = float(grad_penalty.item())
         total_loss = loss_base + (self.lambd * grad_penalty)
+        
+        logger.debug("    train_batch: Starting backward pass")
+        backward_start = time.time()
         total_loss.backward()
+        backward_time = time.time() - backward_start
+        logger.debug(f"    train_batch: Backward pass completed in {backward_time:.4f}s")
+        
+        logger.debug("    train_batch: Optimizer step")
+        step_start = time.time()
         self.optimizer.step()
+        step_time = time.time() - step_start
+        logger.debug(f"    train_batch: Optimizer step completed in {step_time:.4f}s")
 
         if hasattr(self.model, "clear_runtime_state"):
             self.model.clear_runtime_state()
 
+        logger.debug(f"    train_batch: Batch processing complete (total: {time.time() - forward_start:.4f}s)")
         return pred.detach(), total_loss.detach(), all_losses
 

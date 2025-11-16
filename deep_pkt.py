@@ -9,12 +9,22 @@ from __future__ import annotations
 import os
 import gc
 import argparse
+import logging
 from typing import Optional, Tuple
+from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
 import warnings
+
+# Configure logging with timestamps and detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Optional imports for plotting and metrics (may not be available on HPC clusters)
 try:
@@ -53,7 +63,11 @@ from deeppacket import (
     split_deeppacket,
     save_flow_train_test_split,
     load_flow_train_test_split,
+    create_flow_split_dataset_files,
+    has_pre_split_dataset,
+    load_pre_split_dataset,
     run_comprehensive_flow_checks,
+    get_dataset_classes,
 )
 
 # Optional imports for feature explanations
@@ -141,7 +155,7 @@ def build_args() -> TrainArgs:
     parser.add_argument("--limit_files_per_split", type=int, default=0,
                         help="Max files per split (train/val/test). Set small to speed up.")
     parser.add_argument("--max_rows_per_file", type=int, default=None,
-                        help="Cap rows loaded from each .npy file.")
+                        help="Cap rows loaded from each .npy file. Set to 0 or None for no limit.")
     parser.add_argument("--max_batches_per_epoch", type=int, default=200,
                         help="Train only on this many batches per epoch (0 = no cap).")
     parser.add_argument("--eval_batches", type=int, default=50,
@@ -169,6 +183,13 @@ def build_args() -> TrainArgs:
         help="Create and save a new flow-based train/test split before training, then use it.")
     parser.add_argument("--flow_test_size", type=float, default=0.2,
         help="Test size for creating a new flow-based split when --save_flow_split is set.")
+    # Pre-split dataset options (default behavior)
+    parser.add_argument("--create_pre_split", action="store_true",
+        help="Create permanent flow-split dataset files (train/ and test/ directories) if they don't exist.")
+    parser.add_argument("--pre_split_output", type=str, default=None,
+        help="Output directory for pre-split dataset. If None, uses root + '_split' or root itself.")
+    parser.add_argument("--skip_pre_split_check", action="store_true",
+        help="Skip checking for pre-split dataset and use legacy flow_split behavior.")
     parser.add_argument("--use_gsenn", action="store_true", default=False,
         help="Enable GSENN explanations. Disabled by default.")
     parser.add_argument("--use_shap", action="store_true", default=False,
@@ -177,8 +198,23 @@ def build_args() -> TrainArgs:
         help="Enable LIME explanations (requires lime package). Disabled by default.")
     parser.add_argument("--num_workers", type=int, default=None,
         help="Number of data loading workers (default: auto-detect based on CPU count, min 2)")
+    parser.add_argument("--log_level", type=str, default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level: DEBUG (verbose), INFO (default), WARNING, ERROR")
 
     args_ns = parser.parse_args()
+    
+    # Configure logging level based on argument
+    log_level = getattr(logging, args_ns.log_level.upper(), logging.INFO)
+    logging.getLogger().setLevel(log_level)
+    logger.setLevel(log_level)
+    # Also set level for deeppacket modules
+    logging.getLogger('deeppacket').setLevel(log_level)
+
+    # Normalize max_rows_per_file: 0 means no limit (same as None)
+    max_rows_per_file = args_ns.max_rows_per_file
+    if max_rows_per_file == 0:
+        max_rows_per_file = None
 
     args = TrainArgs(
         cuda=args_ns.cuda,
@@ -190,7 +226,7 @@ def build_args() -> TrainArgs:
 
         # NEW: propagate the caps
         limit_files_per_split=args_ns.limit_files_per_split,
-        max_rows_per_file=args_ns.max_rows_per_file,
+        max_rows_per_file=max_rows_per_file,
         max_batches_per_epoch=args_ns.max_batches_per_epoch,
         eval_batches=args_ns.eval_batches,
         
@@ -213,6 +249,9 @@ def build_args() -> TrainArgs:
     args.use_flow_split_manifest = args_ns.use_flow_split_manifest  # type: ignore[attr-defined]
     args.save_flow_split = args_ns.save_flow_split  # type: ignore[attr-defined]
     args.flow_test_size = args_ns.flow_test_size  # type: ignore[attr-defined]
+    args.create_pre_split = args_ns.create_pre_split  # type: ignore[attr-defined]
+    args.pre_split_output = args_ns.pre_split_output  # type: ignore[attr-defined]
+    args.skip_pre_split_check = args_ns.skip_pre_split_check  # type: ignore[attr-defined]
     args.use_gsenn = args_ns.use_gsenn  # type: ignore[attr-defined]
     args.use_shap = args_ns.use_shap  # type: ignore[attr-defined]
     args.use_lime = args_ns.use_lime  # type: ignore[attr-defined]
@@ -278,22 +317,99 @@ class VanillaTrainer(ClassificationTrainer):
 
 
 def main():
+    logger.info("="*70)
+    logger.info("Starting DeepPacket training script")
+    logger.info("="*70)
+    
     args = build_args()
     set_seed(getattr(args, "seed", 2018))
+    logger.info(f"Random seed set to: {getattr(args, 'seed', 2018)}")
 
-    # Probe classes
-    probe = DeepPacketNPYDataset(args.root)  # type: ignore[attr-defined]
-    nclasses = len(probe.classes)
+    # Probe classes (lightweight - just scan directories, don't load data)
+    logger.info(f"Probing dataset classes from: {args.root}")
+    classes = get_dataset_classes(args.root)  # type: ignore[attr-defined]
+    nclasses = len(classes)
     args.nclasses = nclasses
+    logger.info(f"Found {nclasses} classes: {classes}")
 
     # Input dim for DeepPacket vectors
     input_dim = 1500 + 1  # +1 because InputConceptizer appends bias; but parametrizer sees raw x, so keep 1500
     raw_input_dim = 1500
 
     # Data
-    if args.use_flow_split_manifest or args.save_flow_split:
+    logger.info("="*70)
+    logger.info("Loading datasets and creating data loaders")
+    logger.info(f"  Root: {args.root}")
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info(f"  Num workers: {args.num_workers}")
+    logger.info(f"  CUDA enabled: {args.cuda}")
+    logger.info("="*70)
+    
+    # Check for pre-split dataset first (default behavior)
+    use_pre_split = False
+    dataset_root = args.root  # type: ignore[attr-defined]
+    
+    if not args.skip_pre_split_check:  # type: ignore[attr-defined]
+        if has_pre_split_dataset(args.root):
+            logger.info("Found pre-split dataset (train/ and test/ directories). Using pre-split dataset.")
+            use_pre_split = True
+            dataset_root = args.root
+        elif args.create_pre_split:  # type: ignore[attr-defined]
+            # Create pre-split dataset
+            logger.info("Creating permanent flow-split dataset files...")
+            output_root = args.pre_split_output  # type: ignore[attr-defined]
+            if output_root is None:
+                # Check if root already has train/test, if not use root + "_split"
+                if not has_pre_split_dataset(args.root):
+                    output_root = os.path.abspath(args.root) + "_split"
+                else:
+                    output_root = args.root
+            
+            try:
+                train_dir, test_dir = create_flow_split_dataset_files(
+                    root=args.root,
+                    output_root=output_root,
+                    test_size=getattr(args, "flow_test_size", 0.2),
+                    seed=getattr(args, "seed", 2018),
+                    flow_suffix=getattr(args, "flow_suffix", ".flow.npy"),
+                    num_workers=args.num_workers,  # type: ignore[attr-defined]
+                )
+                logger.info(f"Created pre-split dataset at: {output_root}")
+                # Verify it was created successfully
+                if has_pre_split_dataset(output_root):
+                    use_pre_split = True
+                    dataset_root = output_root
+                    logger.info(f"Pre-split dataset verified. Will use: {dataset_root}")
+                else:
+                    logger.warning(f"Pre-split dataset creation completed but verification failed. Falling back to legacy split.")
+            except Exception as e:
+                logger.error(f"Failed to create pre-split dataset: {e}")
+                logger.warning("Falling back to legacy split method.")
+                import traceback
+                traceback.print_exc()
+                raise
+    
+    if use_pre_split:
+        # Load pre-split dataset (no mapping needed, just load files)
+        logger.info("Loading pre-split dataset...")
+        train_loader, test_loader, train_ds, test_ds = load_pre_split_dataset(
+            root=dataset_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,  # type: ignore[arg-type]
+            weight_method=args.weight_method,
+            handle_imbalance=args.handle_imbalance,
+            undersample=args.undersample,
+            undersample_ratio=args.undersample_ratio,
+            undersample_strategy=args.undersample_strategy,
+            pin_memory=args.cuda,  # Enable pin_memory when using GPU
+        )
+        logger.info(f"Train dataset size: {len(train_ds)}")
+        logger.info(f"Test dataset size: {len(test_ds)}")
+        valid_loader = None
+    elif args.use_flow_split_manifest or args.save_flow_split:
         # Use persistent flow-based train/test split
         if args.save_flow_split:
+            logger.info("Creating and saving flow-based train/test split...")
             manifest_path = save_flow_train_test_split(
                 root=args.root,
                 out_dir=None,
@@ -301,9 +417,10 @@ def main():
                 seed=getattr(args, "seed", 2018),
                 flow_suffix=getattr(args, "flow_suffix", ".flow.npy"),
             )
-            print(f"Saved flow split manifest: {manifest_path}")
+            logger.info(f"Saved flow split manifest: {manifest_path}")
             args.use_flow_split_manifest = manifest_path  # type: ignore[attr-defined]
 
+        logger.info("Loading flow-based train/test split from manifest...")
         train_loader, test_loader, train_ds, test_ds = load_flow_train_test_split(
             split_manifest_path=args.use_flow_split_manifest,  # type: ignore[arg-type]
             batch_size=args.batch_size,
@@ -317,9 +434,12 @@ def main():
             root_override=args.root,  # Allow overriding manifest root for cross-system compatibility
             pin_memory=args.cuda,  # Enable pin_memory when using GPU
         )
+        logger.info(f"Train dataset size: {len(train_ds)}")
+        logger.info(f"Test dataset size: {len(test_ds)}")
         valid_loader = None
     else:
         if args.flow_split:
+            logger.info("Creating flow-based split (train/val/test)...")
             train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds = split_deeppacket_by_flow(
                 root=args.root,
                 valid_size=0.1, test_size=0.1,
@@ -334,7 +454,11 @@ def main():
                 undersample_strategy=args.undersample_strategy,
                 pin_memory=args.cuda,  # Enable pin_memory when using GPU
             )
+            logger.info(f"Train dataset size: {len(train_ds)}")
+            logger.info(f"Val dataset size: {len(val_ds)}")
+            logger.info(f"Test dataset size: {len(test_ds)}")
         else:
+            logger.info("Creating random split (train/val/test)...")
             train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds = split_deeppacket(
                 root=args.root,
                 valid_size=0.1, test_size=0.1,
@@ -350,9 +474,13 @@ def main():
                 undersample_strategy=args.undersample_strategy,
                 pin_memory=args.cuda,  # Enable pin_memory when using GPU
             )
+            logger.info(f"Train dataset size: {len(train_ds)}")
+            logger.info(f"Val dataset size: {len(val_ds)}")
+            logger.info(f"Test dataset size: {len(test_ds)}")
     # Comprehensive flow-based sanity checks (if using runtime flow split)
-    # Skip for saved manifest path (no val split available, and we assume manifest is authoritative)
-    if getattr(args, "flow_split", False) and (not args.use_flow_split_manifest):
+    # Skip for pre-split datasets, saved manifest path, and pre-split datasets
+    # (no val split available, and we assume manifest/pre-split is authoritative)
+    if (not use_pre_split) and getattr(args, "flow_split", False) and (not args.use_flow_split_manifest):
         run_comprehensive_flow_checks(args.root, train_ds, val_ds, test_ds, 
                                       flow_suffix=args.flow_suffix)
     
@@ -393,15 +521,43 @@ def main():
         trainer = GradPenaltyTrainer(model, args, typ=typ)
 
     # Train & evaluate
+    logger.info("="*70)
+    logger.info("Starting training")
+    logger.info(f"  Epochs: {args.epochs}")
+    logger.info(f"  Model path: {model_path}")
+    logger.info("="*70)
+    
     trainer.train(train_loader, valid_loader, epochs=args.epochs, save_path=model_path)
     device = torch.device("cuda" if (args.cuda and torch.cuda.is_available()) else "cpu")
+    logger.info(f"Moving model to device: {device}")
     trainer.model.to(device)
     print_full_config(args, trainer.model)
 
+    logger.info("="*70)
+    logger.info("Computing accuracies on train/val/test sets")
+    logger.info("="*70)
+    
     print("Computing accuracies…")
-    train_acc = trainer.validate(train_loader) if train_loader is not None else None
-    val_acc = trainer.validate(valid_loader) if valid_loader is not None else None
-    test_acc = trainer.evaluate(test_loader) if test_loader is not None else None
+    if train_loader is not None:
+        logger.info("Evaluating on training set...")
+        train_acc = trainer.validate(train_loader)
+    else:
+        train_acc = None
+        logger.info("Skipping training set evaluation (no train_loader)")
+    
+    if valid_loader is not None:
+        logger.info("Evaluating on validation set...")
+        val_acc = trainer.validate(valid_loader)
+    else:
+        val_acc = None
+        logger.info("Skipping validation set evaluation (no valid_loader)")
+    
+    if test_loader is not None:
+        logger.info("Evaluating on test set...")
+        test_acc = trainer.evaluate(test_loader)
+    else:
+        test_acc = None
+        logger.info("Skipping test set evaluation (no test_loader)")
 
     print("\nFinal accuracies:")
     print(f"  Train Accuracy : {train_acc:.2f}%" if train_acc is not None else "  Train Accuracy : (n/a)")
@@ -413,7 +569,7 @@ def main():
         y_pred, y_true = trainer.predict(test_loader)
         
         # Get all class names and labels (including those with zero predictions)
-        class_names = probe.classes
+        class_names = classes
         all_labels = list(range(len(class_names)))
         
         # Compute and print confusion matrix and classification report if sklearn.metrics is available
@@ -507,7 +663,7 @@ def main():
             
             # Create feature names for packet bytes (0-1499)
             feature_names = [f"byte_{i}" for i in range(1500)]
-            class_names = probe.classes
+            class_names = classes
             
             # Prepare training data for SHAP/LIME (need numpy arrays) - LIMIT SIZE
             print("Preparing training data for explainers (limiting to 5000 samples for memory)...")
