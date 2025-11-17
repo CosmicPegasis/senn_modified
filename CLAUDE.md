@@ -102,7 +102,6 @@ Key arguments:
 - `--root`: Directory with preprocessed `.npy` files organized by class
 - `--train`: Train from scratch (omit to load existing model)
 - `--epochs`: Number of training epochs
-- `--flow_split`: Use flow-based splitting (default: True)
 - `--nconcepts`: Number of interpretable concepts (default: 10)
 - `--theta_reg_lambda`: Regularization strength for θ stability (default: 1e-2)
 - `--theta_reg_type`: Regularization type (grad1/grad2/grad3, default: grad3)

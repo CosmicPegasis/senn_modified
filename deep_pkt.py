@@ -60,7 +60,6 @@ from deeppacket import (
     GradPenaltyTrainer,
     DeepPacketNPYDataset,
     split_deeppacket_by_flow,
-    split_deeppacket,
     save_flow_train_test_split,
     load_flow_train_test_split,
     create_flow_split_dataset_files,
@@ -115,7 +114,7 @@ def build_args() -> TrainArgs:
             "  # Basic training with default settings:\n"
             "  python deep_pkt.py --root proc_pcaps/ --epochs 10 --cuda\n\n"
             "  # Training with flow-based split:\n"
-            "  python deep_pkt.py --root proc_pcaps/ --flow_split --epochs 20 --cuda\n\n"
+            "  python deep_pkt.py --root proc_pcaps/ --epochs 20 --cuda\n\n"
             "  # Training with class imbalance handling:\n"
             "  python deep_pkt.py --root proc_pcaps/ --handle_imbalance --undersample --cuda\n\n"
             "  # GPU-optimized GSENN explanations (fast, all datasets):\n"
@@ -163,8 +162,6 @@ def build_args() -> TrainArgs:
     parser.add_argument("--undersample_strategy", type=str, default="random",
                         choices=["random", "stratified"],
                         help="Undersampling strategy: random or stratified.")
-    parser.add_argument("--flow_split", action="store_true",
-        help="Split train/val/test by FLOW (requires aligned *.flow.npy sidecars).")
     parser.add_argument("--flow_suffix", type=str, default=".flow.npy",
         help="Sidecar suffix for flow IDs (default: .flow.npy).")
     # Saved flow split options
@@ -180,7 +177,7 @@ def build_args() -> TrainArgs:
     parser.add_argument("--pre_split_output", type=str, default=None,
         help="Output directory for pre-split dataset. If None, uses root + '_split' or root itself.")
     parser.add_argument("--skip_pre_split_check", action="store_true",
-        help="Skip checking for pre-split dataset and use legacy flow_split behavior.")
+        help="Skip checking for pre-split dataset and always regenerate splits on the fly.")
     parser.add_argument("--use_gsenn", action="store_true", default=False,
         help="Enable GSENN explanations. Disabled by default.")
     parser.add_argument("--use_gpu_explanations", action="store_true", default=False,
@@ -238,7 +235,6 @@ def build_args() -> TrainArgs:
     args.root = args_ns.root         # type: ignore[attr-defined]
     args.batch_size = args_ns.batch_size  # type: ignore[attr-defined]
     args.seed = args_ns.seed         # type: ignore[attr-defined]
-    args.flow_split = args_ns.flow_split  # type: ignore[attr-defined]
     args.flow_suffix = args_ns.flow_suffix  # type: ignore[attr-defined]
     args.use_flow_split_manifest = args_ns.use_flow_split_manifest  # type: ignore[attr-defined]
     args.save_flow_split = args_ns.save_flow_split  # type: ignore[attr-defined]
@@ -433,49 +429,28 @@ def main():
         logger.info(f"Test dataset size: {len(test_ds)}")
         valid_loader = None
     else:
-        if args.flow_split:
-            logger.info("Creating flow-based split (train/val/test)...")
-            train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds = split_deeppacket_by_flow(
-                root=args.root,
-                valid_size=0.1, test_size=0.1,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,  # type: ignore[arg-type]
-                weight_method=args.weight_method,
-                max_rows_per_file=args.max_rows_per_file,
-                handle_imbalance=args.handle_imbalance,
-                flow_suffix=args.flow_suffix,
-                undersample=args.undersample,
-                undersample_ratio=args.undersample_ratio,
-                undersample_strategy=args.undersample_strategy,
-                pin_memory=args.cuda,  # Enable pin_memory when using GPU
-            )
-            logger.info(f"Train dataset size: {len(train_ds)}")
-            logger.info(f"Val dataset size: {len(val_ds)}")
-            logger.info(f"Test dataset size: {len(test_ds)}")
-        else:
-            logger.info("Creating random split (train/val/test)...")
-            train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds = split_deeppacket(
-                root=args.root,
-                valid_size=0.1, test_size=0.1,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,  # type: ignore[arg-type]
-                shuffle=True,
-                limit_files_per_split=args.limit_files_per_split,
-                max_rows_per_file=args.max_rows_per_file,
-                handle_imbalance=args.handle_imbalance,
-                weight_method=args.weight_method,
-                undersample=args.undersample,
-                undersample_ratio=args.undersample_ratio,
-                undersample_strategy=args.undersample_strategy,
-                pin_memory=args.cuda,  # Enable pin_memory when using GPU
-            )
-            logger.info(f"Train dataset size: {len(train_ds)}")
-            logger.info(f"Val dataset size: {len(val_ds)}")
-            logger.info(f"Test dataset size: {len(test_ds)}")
+        logger.info("Creating flow-based split (train/val/test)...")
+        train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds = split_deeppacket_by_flow(
+            root=args.root,
+            valid_size=0.1, test_size=0.1,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,  # type: ignore[arg-type]
+            weight_method=args.weight_method,
+            max_rows_per_file=args.max_rows_per_file,
+            handle_imbalance=args.handle_imbalance,
+            flow_suffix=args.flow_suffix,
+            undersample=args.undersample,
+            undersample_ratio=args.undersample_ratio,
+            undersample_strategy=args.undersample_strategy,
+            pin_memory=args.cuda,  # Enable pin_memory when using GPU
+        )
+        logger.info(f"Train dataset size: {len(train_ds)}")
+        logger.info(f"Val dataset size: {len(val_ds)}")
+        logger.info(f"Test dataset size: {len(test_ds)}")
     # Comprehensive flow-based sanity checks (if using runtime flow split)
     # Skip for pre-split datasets, saved manifest path, and pre-split datasets
     # (no val split available, and we assume manifest/pre-split is authoritative)
-    if (not use_pre_split) and getattr(args, "flow_split", False) and (not args.use_flow_split_manifest):
+    if (not use_pre_split) and (not args.use_flow_split_manifest):
         run_comprehensive_flow_checks(args.root, train_ds, val_ds, test_ds, 
                                       flow_suffix=args.flow_suffix)
     

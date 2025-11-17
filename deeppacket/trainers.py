@@ -53,7 +53,6 @@ class TrainArgs:
     undersample_ratio: float = 0.1
     undersample_strategy: str = "random"
 
-    flow_split: bool = True
     flow_suffix: str = ".flow.npy"
 
 

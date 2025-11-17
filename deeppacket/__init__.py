@@ -34,7 +34,6 @@ from .datasets import (
 
 from .flow_utils import (
     split_deeppacket_by_flow,
-    split_deeppacket,
     save_flow_train_test_split,
     load_flow_train_test_split,
     create_flow_split_dataset_files,
@@ -75,7 +74,6 @@ __all__ = [
     "get_dataset_classes",
     # Flow utils
     "split_deeppacket_by_flow",
-    "split_deeppacket",
     "save_flow_train_test_split",
     "load_flow_train_test_split",
     "create_flow_split_dataset_files",

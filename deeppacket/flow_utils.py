@@ -1108,112 +1108,6 @@ def split_deeppacket_by_flow(
     return train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds
 
 
-def split_deeppacket(
-    root: str,
-    valid_size: float = 0.1,
-    test_size: float = 0.1,
-    batch_size: int = 128,
-    num_workers: int = 2,
-    shuffle: bool = True,
-    limit_files_per_split: int = 0,
-    max_rows_per_file: int = None,
-    handle_imbalance: bool = False,
-    weight_method: str = "balanced",
-    undersample: bool = False,
-    undersample_ratio: float = 0.1,
-    undersample_strategy: str = "random",
-    pin_memory: bool = False,
-):
-    """Split dataset by files (not flow-aware)."""
-    tmp = DeepPacketNPYDataset(root)
-    files = list(tmp.files)
-    n_files = len(files)
-    indices = np.arange(n_files)
-    if shuffle:
-        rng = np.random.RandomState(2018)
-        rng.shuffle(indices)
-
-    n_test = int(np.floor(test_size * n_files))
-    n_val  = int(np.floor(valid_size * n_files))
-
-    test_idx  = indices[:n_test]
-    val_idx   = indices[n_test:n_test + n_val]
-    train_idx = indices[n_test + n_val:]
-
-    # --- LIMIT FILE COUNT PER SPLIT ---
-    def take(arr, n):
-        return arr[:min(n, len(arr))] if (n and n > 0) else arr
-
-    test_idx  = take(test_idx,  limit_files_per_split)
-    val_idx   = take(val_idx,   limit_files_per_split)
-    train_idx = take(train_idx, limit_files_per_split)
-
-    # Pass max_rows_per_file and weight_method down to datasets
-    train_ds = DeepPacketNPYDataset(root, split_indices=train_idx.tolist(), max_rows_per_file=max_rows_per_file, weight_method=weight_method)
-    val_ds   = DeepPacketNPYDataset(root, split_indices=val_idx.tolist(),   max_rows_per_file=max_rows_per_file, weight_method=weight_method)
-    test_ds  = DeepPacketNPYDataset(root, split_indices=test_idx.tolist(),  max_rows_per_file=max_rows_per_file, weight_method=weight_method)
-    
-    # Apply undersampling to training set if enabled
-    if undersample:
-        print(f"Applying undersampling (ratio={undersample_ratio}, strategy={undersample_strategy})...")
-        train_ds_original = train_ds
-        train_ds = train_ds.apply_undersampling(ratio=undersample_ratio, strategy=undersample_strategy)
-        print(f"Original training samples: {train_ds_original.total}")
-        print(f"Undersampled training samples: {train_ds.total}")
-
-    # Print class distribution information
-    print(f"Class distribution in training set:")
-    for class_name, class_idx in train_ds.class_to_idx.items():
-        count = train_ds.class_counts[class_idx]
-        print(f"  {class_name}: {count} samples")
-    print(f"Class distribution in validation set:")
-    for class_name, class_idx in val_ds.class_to_idx.items():
-        count = val_ds.class_counts[class_idx]
-        print(f"  {class_name}: {count} samples")
-    print(f"Class distribution in test set:")
-    for class_name, class_idx in test_ds.class_to_idx.items():
-        count = test_ds.class_counts[class_idx]
-        print(f"  {class_name}: {count} samples")
-    
-    if handle_imbalance:
-        print(f"Class weights (method: {weight_method}):")
-        for class_name, class_idx in train_ds.class_to_idx.items():
-            weight = train_ds.class_weights[class_idx]
-            print(f"  {class_name}: {weight:.4f}")
-
-    # Optimize DataLoader settings: pin_memory for GPU, persistent_workers for efficiency
-    # These optimizations significantly improve GPU training performance
-    dl_args = dict(
-        batch_size=batch_size, 
-        num_workers=num_workers, 
-        pin_memory=pin_memory,  # Faster CPU->GPU transfer when using GPU
-    )
-    # Add advanced optimizations (PyTorch 1.7+)
-    if num_workers > 0:
-        dl_args['persistent_workers'] = True  # Keep workers alive between epochs
-        dl_args['prefetch_factor'] = 2  # Prefetch 2 batches per worker
-    
-    # Create data loaders with optional weighted sampling
-    if handle_imbalance:
-        # Use WeightedRandomSampler for training to handle class imbalance
-        sample_weights = train_ds.get_sample_weights()
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True
-        )
-        train_loader = DataLoader(train_ds, sampler=sampler, **dl_args)
-    else:
-        train_loader = DataLoader(train_ds, shuffle=True, **dl_args)
-    
-    # Shuffle val/test sets so eval_batches gets representative samples
-    valid_loader = DataLoader(val_ds,  shuffle=True, **dl_args)
-    test_loader  = DataLoader(test_ds, shuffle=True, **dl_args)
-    # Sanity check: ensure no overlapping flows across splits (uses sidecars if present)
-    _assert_no_flow_overlap_datasets(train_ds, val_ds, test_ds, flow_suffix=".flow.npy")
-    return train_loader, valid_loader, test_loader, train_ds, val_ds, test_ds
-
-
 def save_flow_train_test_split(
     root: str,
     out_dir: Optional[str] = None,
@@ -1235,7 +1129,7 @@ def save_flow_train_test_split(
     train_per = _rows_to_per_file_dict(base, train_rows)
     test_per = _rows_to_per_file_dict(base, test_rows)
 
-    # Print basic distro info similar to split_deeppacket
+    # Print basic packet-level distribution info for compatibility
     def count_per_class(per_dict):
         counts = {i: 0 for i in range(len(base.classes))}
         for file_idx, rows in per_dict.items():
