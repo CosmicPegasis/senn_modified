@@ -10,7 +10,7 @@ import os
 import gc
 import argparse
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from datetime import datetime
 
 import numpy as np
@@ -619,8 +619,8 @@ def main():
             aggregated_by_dataset[dataset_name] = aggregated
 
             # Print summary
-            for cls_idx, mean_attr in aggregated.items():
-                n_samples = np.sum(explanations['targets'] == cls_idx)
+            for cls_idx, stats in aggregated.items():
+                n_samples = stats['count']
                 print(f"  Class {cls_idx} ({classes[cls_idx]}): {n_samples} samples")
 
         # Visualize and save results
@@ -630,17 +630,20 @@ def main():
             print("=" * 70)
 
             for dataset_name, aggregated in aggregated_by_dataset.items():
-                for cls_idx, mean_attributions in aggregated.items():
-                    # Create visualization (top 20 most important bytes)
-                    importance = np.abs(mean_attributions)
-                    top_k = 20
+                for cls_idx, class_stats in aggregated.items():
+                    mean_attributions = class_stats['mean']
+                    importance = class_stats['mean_abs']
+                    top_k = min(20, len(importance))
+                    if top_k == 0:
+                        continue
                     top_indices = np.argsort(importance)[-top_k:][::-1]
-                    top_values = importance[top_indices]
+                    top_values = mean_attributions[top_indices]
 
                     plt.figure(figsize=(10, 6))
-                    plt.barh(range(top_k), top_values)
+                    colors = ['red' if v > 0 else 'blue' for v in top_values]
+                    plt.barh(range(top_k), top_values, color=colors, alpha=0.8)
                     plt.yticks(range(top_k), [f"byte_{i}" for i in top_indices])
-                    plt.xlabel('Absolute Attribution (Importance)')
+                    plt.xlabel('Mean Attribution')
                     plt.title(f'Top {top_k} Important Bytes - {dataset_name} - {classes[cls_idx]}')
                     plt.gca().invert_yaxis()
                     plt.tight_layout()
@@ -654,28 +657,77 @@ def main():
                     plt.close()
                     print(f"  Saved: {plot_path}")
 
-        # Save raw explanations and aggregations
-        print("\n" + "=" * 70)
-        print("Saving explanation results...")
-        print("=" * 70)
+        # Build plaintext summary similar to robust_interpret output
+        if aggregated_by_dataset:
+            print("\n" + "=" * 70)
+            print(" GPU EXPLANATION SUMMARY")
+            print("=" * 70)
 
-        for dataset_name, explanations in all_explanations.items():
-            # Save raw explanations
-            np.savez_compressed(
-                os.path.join(model_path, f'gsenn_gpu_{dataset_name}_raw.npz'),
-                attributions=explanations['attributions'],
-                predictions=explanations['predictions'],
-                targets=explanations['targets'],
-            )
-            print(f"  Saved raw {dataset_name} explanations")
+            summary_lines: List[str] = []
+            summary_lines.append("=" * 70)
+            summary_lines.append(" GPU EXPLANATION SUMMARY")
+            datasets_list = ", ".join(aggregated_by_dataset.keys())
+            summary_lines.append(f" Datasets: {datasets_list}")
+            summary_lines.append("=" * 70)
+            summary_lines.append("")
 
-            # Save aggregated explanations
-            aggregated = aggregated_by_dataset[dataset_name]
-            np.savez_compressed(
-                os.path.join(model_path, f'gsenn_gpu_{dataset_name}_aggregated.npz'),
-                **{f'class_{cls_idx}': mean_attr for cls_idx, mean_attr in aggregated.items()}
-            )
-            print(f"  Saved aggregated {dataset_name} explanations")
+            top_k = 20
+
+            for dataset_name, aggregated in aggregated_by_dataset.items():
+                summary_lines.append(f"\nDataset: {dataset_name}")
+                summary_lines.append("-" * 70)
+                print(f"\nDataset: {dataset_name}")
+                print("-" * 70)
+
+                for cls_idx, class_stats in aggregated.items():
+                    class_name = classes[cls_idx]
+                    count = class_stats['count']
+                    summary_lines.append(f"\n{class_name} (class {cls_idx})")
+                    summary_lines.append(f"  Samples: {count}")
+                    print(f"\n{class_name} (class {cls_idx})")
+                    print(f"  Samples: {count}")
+
+                    if count == 0:
+                        summary_lines.append("  No samples available for this class.")
+                        print("  No samples available for this class.")
+                        continue
+
+                    mean_vals = class_stats['mean']
+                    std_vals = class_stats['std']
+                    mean_abs_vals = class_stats['mean_abs']
+
+                    k = min(top_k, len(mean_vals))
+                    top_indices = np.argsort(mean_abs_vals)[-k:][::-1]
+
+                    header = "    Byte | Mean | Std | Mean |abs||"
+                    divider = "    " + "-" * 50
+                    summary_lines.append(f"\n  Top {k} important bytes:")
+                    summary_lines.append(header)
+                    summary_lines.append(divider)
+                    print(f"\n  Top {k} important bytes:")
+                    print(header)
+                    print(divider)
+                    for idx in top_indices:
+                        line = (
+                            f"    byte_{idx:4d} | "
+                            f"{mean_vals[idx]:7.4f} | "
+                            f"{std_vals[idx]:6.4f} | "
+                            f"{mean_abs_vals[idx]:8.4f}"
+                        )
+                        summary_lines.append(line)
+                        print(line)
+
+            summary_lines.append("\n" + "=" * 70)
+            summary_lines.append(" GPU EXPLANATIONS COMPLETE")
+            summary_lines.append("=" * 70)
+
+            summary_path = os.path.join(model_path, "gsenn_gpu_feature_importance_summary.txt")
+            with open(summary_path, "w") as f:
+                f.write("\n".join(summary_lines))
+            print(f"\nSummary saved to: {summary_path}")
+
+        # Clean up large arrays to free memory
+        del all_explanations
 
         print("\n" + "=" * 70)
         print("GPU-optimized explanation generation complete!")

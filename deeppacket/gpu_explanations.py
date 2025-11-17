@@ -333,37 +333,55 @@ class GPUExplanationGenerator:
         self,
         explanations: Dict[str, np.ndarray],
         class_names: List[str],
-    ) -> Dict[int, np.ndarray]:
+    ) -> Dict[int, Dict[str, np.ndarray]]:
         """
-        Aggregate explanations by true class.
+        Aggregate explanations by true class and compute summary statistics.
 
         Args:
             explanations: Dictionary from generate_explanations/generate_all_explanations
             class_names: List of class names
 
         Returns:
-            Dictionary mapping class_idx -> mean_attributions (n_features,)
+            Dictionary mapping class_idx -> {
+                'mean': (n_features,) mean attribution vector
+                'std': (n_features,) standard deviation of attributions
+                'mean_abs': (n_features,) mean absolute attribution
+                'count': number of samples contributing to stats
+            }
         """
         attributions = explanations['attributions']
         targets = explanations['targets']
+        n_features = attributions.shape[1] if attributions.ndim == 2 else 0
 
-        aggregated = {}
+        aggregated: Dict[int, Dict[str, np.ndarray]] = {}
 
         for class_idx in range(len(class_names)):
             # Get all samples for this class
             class_mask = targets == class_idx
             class_attributions = attributions[class_mask]
+            sample_count = len(class_attributions)
 
-            if len(class_attributions) > 0:
-                # Compute mean attributions
+            if sample_count > 0:
                 mean_attr = np.mean(class_attributions, axis=0)
-                aggregated[class_idx] = mean_attr
+                std_attr = np.std(class_attributions, axis=0)
+                mean_abs_attr = np.mean(np.abs(class_attributions), axis=0)
 
-                logger.info(f"Class {class_idx} ({class_names[class_idx]}): "
-                          f"{len(class_attributions)} samples")
+                logger.info(
+                    f"Class {class_idx} ({class_names[class_idx]}): {sample_count} samples"
+                )
             else:
-                logger.warning(f"Class {class_idx} ({class_names[class_idx]}): "
-                             f"No samples found")
-                aggregated[class_idx] = np.zeros(attributions.shape[1])
+                logger.warning(
+                    f"Class {class_idx} ({class_names[class_idx]}): No samples found"
+                )
+                mean_attr = np.zeros(n_features, dtype=np.float32)
+                std_attr = np.zeros(n_features, dtype=np.float32)
+                mean_abs_attr = np.zeros(n_features, dtype=np.float32)
+
+            aggregated[class_idx] = {
+                'mean': mean_attr,
+                'std': std_attr,
+                'mean_abs': mean_abs_attr,
+                'count': sample_count,
+            }
 
         return aggregated
