@@ -313,6 +313,25 @@ def main():
     logger.info("="*70)
     
     args = build_args()
+
+    # If --create_pre_split is provided, materialize the split and exit immediately.
+    if getattr(args, "create_pre_split", False):
+        logger.info("create_pre_split flag detected. Generating flow-based dataset split and exiting.")
+        try:
+            create_flow_split_dataset_files(
+                root=args.root,
+                output_root=args.pre_split_output,
+                test_size=getattr(args, "flow_test_size", 0.2),
+                seed=getattr(args, "seed", 2018),
+                flow_suffix=getattr(args, "flow_suffix", ".flow.npy"),
+                num_workers=getattr(args, "num_workers", None),
+            )
+            logger.info("Flow-based dataset split created successfully. Exiting.")
+        except Exception:
+            logger.exception("Failed to create flow-based dataset split.")
+            raise
+        return
+
     set_seed(getattr(args, "seed", 2018))
     logger.info(f"Random seed set to: {getattr(args, 'seed', 2018)}")
 

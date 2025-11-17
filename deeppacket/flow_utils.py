@@ -302,6 +302,20 @@ def stratified_flow_train_test_split(by_flow, flow_to_class, test_size=0.2, seed
     return np.array(train_idx, dtype=np.int64), np.array(test_idx, dtype=np.int64)
 
 
+def rows_to_file_indices(ds, rows):
+    """
+    Convert global row indices into per-file relative indices.
+    Returns a dict mapping file_idx -> list[row_idx].
+    """
+    per_file = defaultdict(list)
+    for gidx in rows.tolist():
+        fidx = bisect.bisect_right(ds.offsets, gidx) - 1
+        fidx = min(max(fidx, 0), len(ds.offsets) - 2)
+        ridx = gidx - ds.offsets[fidx]
+        per_file[fidx].append(int(ridx))
+    return per_file
+
+
 def create_flow_split_dataset_files(
     root: str,
     output_root: Optional[str] = None,
@@ -313,26 +327,12 @@ def create_flow_split_dataset_files(
 ) -> Tuple[str, str]:
     """
     Create permanent flow-split dataset by writing new .npy files.
-    
-    Reads ALL .npy files from root (entire dataset, no row limits), groups by flow ID, 
-    splits flows into train/test, and writes new .npy files to output_root/train/ and 
-    output_root/test/.
-    
-    IMPORTANT: This function uses the ENTIRE dataset - no max_rows_per_file limits are applied.
-    
-    Args:
-        root: Source directory with class folders containing .npy and .flow.npy files
-        output_root: Output directory where train/ and test/ subdirectories will be created.
-                     If None, uses root + "_split"
-        test_size: Fraction of flows to put in test set
-        seed: Random seed for splitting
-        flow_suffix: Suffix for flow ID sidecar files
-        chunk_size: Number of rows to write per output chunk file
-        num_workers: Number of worker threads for parallel processing. 
-                    Should use the same logic as data loading workers (at least 2, or half CPUs).
-        
-    Returns:
-        Tuple of (train_dir, test_dir) paths
+
+    This variant loads each source .npy file exactly once (now in parallel),
+    keeps all split samples in RAM, and writes one consolidated file per
+    class/split at the very end (also in parallel, single open per file).
+    The chunk_size argument remains for backward compatibility (unused),
+    while num_workers controls the concurrency level for both stages.
     """
     function_start_time = time.time()
     logger.info("="*70)
@@ -342,33 +342,31 @@ def create_flow_split_dataset_files(
     logger.info(f"  test_size: {test_size}")
     logger.info(f"  seed: {seed}")
     logger.info(f"  flow_suffix: {flow_suffix}")
-    logger.info(f"  chunk_size: {chunk_size}")
-    logger.info(f"  num_workers: {num_workers}")
+    logger.info(f"  chunk_size: {chunk_size} (unused)")
+    logger.info(f"  num_workers: {num_workers} (parallel readers/writers)")
     logger.info("="*70)
-    
-    # Determine output directory
+
     if output_root is None:
         output_root = os.path.abspath(root) + "_split"
     else:
         output_root = os.path.abspath(output_root)
-    
     logger.info(f"Output directory: {output_root}")
-    
-    # Load base dataset to get file structure
-    # IMPORTANT: Use max_rows_per_file=None to ensure we use the ENTIRE dataset
+
     logger.info("Loading base dataset...")
     load_start = time.time()
     base = FlowAwareDeepPacketDataset(root, max_rows_per_file=None, flow_suffix=flow_suffix)
     load_time = time.time() - load_start
-    logger.info(f"Loaded base dataset with {base.total} total samples across {len(base.files)} files in {load_time:.2f}s")
+    logger.info(
+        f"Loaded base dataset with {base.total} total samples across {len(base.files)} files in {load_time:.2f}s"
+    )
     print(f"Loaded base dataset with {base.total} total samples across {len(base.files)} files")
-    
+
     logger.info("Grouping indices by flow...")
     group_start = time.time()
     by_flow, flow_to_class = group_indices_by_flow(base)
     group_time = time.time() - group_start
     logger.info(f"Grouped {len(by_flow)} flows in {group_time:.2f}s")
-    
+
     logger.info(f"Splitting flows into train/test (test_size={test_size})...")
     split_start = time.time()
     train_rows, test_rows = stratified_flow_train_test_split(
@@ -376,390 +374,132 @@ def create_flow_split_dataset_files(
     )
     split_time = time.time() - split_start
     logger.info(f"Split into {len(train_rows)} train rows and {len(test_rows)} test rows in {split_time:.2f}s")
-    
-    # Convert global indices to (file_idx, row_idx) tuples and group by class in one pass
-    # This avoids creating huge intermediate lists
-    def rows_to_class_pairs(ds, rows):
-        """Convert rows to class-grouped pairs without storing all pairs in memory."""
-        logger.debug(f"Converting {len(rows)} rows to class pairs...")
-        by_class = defaultdict(list)
-        for gidx in rows:
-            fidx = bisect.bisect_right(ds.offsets, gidx) - 1
-            fidx = min(max(fidx, 0), len(ds.offsets) - 2)
-            ridx = gidx - ds.offsets[fidx]
-            _, class_idx = ds.files[fidx]
-            class_name = ds.classes[class_idx]
-            by_class[class_name].append((fidx, ridx))
-        logger.debug(f"Converted to {len(by_class)} classes")
-        return by_class
-    
-    logger.info("Processing train rows into class pairs...")
-    print("Processing train rows...")
-    train_start = time.time()
-    train_by_class = rows_to_class_pairs(base, train_rows)
-    train_time = time.time() - train_start
-    logger.info(f"Processed train rows into {len(train_by_class)} classes in {train_time:.2f}s")
-    for class_name, pairs in train_by_class.items():
-        logger.debug(f"  Train class {class_name}: {len(pairs)} pairs")
-    
-    # Clear train_rows and by_flow to free memory
-    del train_rows, by_flow, flow_to_class
+
+    logger.info("Grouping rows by file for train/test splits...")
+    group_start = time.time()
+    train_by_file = rows_to_file_indices(base, train_rows)
+    test_by_file = rows_to_file_indices(base, test_rows)
+    group_time = time.time() - group_start
+    logger.info(
+        f"Grouped rows by file in {group_time:.2f}s (train files: {len(train_by_file)}, test files: {len(test_by_file)})"
+    )
+
+    del train_rows, test_rows, by_flow, flow_to_class
     gc.collect()
-    logger.debug("Freed memory after train row processing")
-    
-    logger.info("Processing test rows into class pairs...")
-    print("Processing test rows...")
-    test_start = time.time()
-    test_by_class = rows_to_class_pairs(base, test_rows)
-    test_time = time.time() - test_start
-    logger.info(f"Processed test rows into {len(test_by_class)} classes in {test_time:.2f}s")
-    for class_name, pairs in test_by_class.items():
-        logger.debug(f"  Test class {class_name}: {len(pairs)} pairs")
-    
-    # Clear test_rows to free memory
-    del test_rows
+
+    split_storage = {"train": defaultdict(list), "test": defaultdict(list)}
+    split_counts = {"train": defaultdict(int), "test": defaultdict(int)}
+    split_locks = {
+        "train": defaultdict(threading.Lock),
+        "test": defaultdict(threading.Lock),
+    }
+
+    worker_count = num_workers if num_workers and num_workers > 0 else min(32, (os.cpu_count() or 1))
+    if worker_count < 1:
+        worker_count = 1
+
+    logger.info(
+        f"Loading each source file once (parallelized across {worker_count} worker(s)) "
+        "and caching split contents in memory..."
+    )
+
+    def process_file(fidx: int, train_rows_for_file, test_rows_for_file):
+        path, class_idx = base.files[fidx]
+        class_name = base.classes[class_idx]
+        logger.debug(
+            f"[reader] Loading file {fidx} ({os.path.basename(path)}) for class {class_name}"
+        )
+        arr = np.load(path, mmap_mode="r")
+        try:
+            if train_rows_for_file:
+                selected_train = arr[train_rows_for_file]
+                with split_locks["train"][class_name]:
+                    split_storage["train"][class_name].append(selected_train.copy())
+                    split_counts["train"][class_name] += selected_train.shape[0]
+                logger.debug(
+                    f"[reader] File {fidx}: added {selected_train.shape[0]} train samples"
+                )
+            if test_rows_for_file:
+                selected_test = arr[test_rows_for_file]
+                with split_locks["test"][class_name]:
+                    split_storage["test"][class_name].append(selected_test.copy())
+                    split_counts["test"][class_name] += selected_test.shape[0]
+                logger.debug(
+                    f"[reader] File {fidx}: added {selected_test.shape[0]} test samples"
+                )
+        finally:
+            del arr
+
+    read_futures = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for fidx in range(len(base.files)):
+            train_rows_for_file = train_by_file.get(fidx)
+            test_rows_for_file = test_by_file.get(fidx)
+            if not train_rows_for_file and not test_rows_for_file:
+                continue
+            read_futures.append(
+                executor.submit(process_file, fidx, train_rows_for_file, test_rows_for_file)
+            )
+        for future in as_completed(read_futures):
+            future.result()
+
+    del train_by_file, test_by_file
     gc.collect()
-    logger.debug("Freed memory after test row processing")
-    
-    # Create output directories
+
     train_dir = os.path.join(output_root, "train")
     test_dir = os.path.join(output_root, "test")
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
-    
-    # Helper to write chunks for a class - memory-efficient version
-    # Made standalone for threading - takes file paths instead of base object
-    # Now processes a subset of pairs (a chunk) for parallelization within a class
-    def write_class_chunk_worker(args_tuple):
-        """
-        Worker function for writing a chunk of class data in a memory-efficient way.
-        Processes a subset of pairs (chunk) to enable parallelization within a single class.
-        Thread-safe version that takes file paths directly.
-        
-        Args:
-            args_tuple: (class_name, pairs_chunk, chunk_id, output_base_dir, files_list, chunk_size)
-                - pairs_chunk: Subset of (fidx, ridx) pairs to process
-                - chunk_id: Unique identifier for this chunk (used in output filename)
-        """
-        thread_id = threading.current_thread().ident
-        thread_name = threading.current_thread().name
-        start_time = time.time()
-        
-        try:
-            class_name, pairs_chunk, chunk_id, output_base_dir, files_list, chunk_size = args_tuple
-            logger.info(f"[Worker {thread_id} ({thread_name})] Starting chunk {chunk_id} for class {class_name} with {len(pairs_chunk)} pairs")
-            
-            class_dir = os.path.join(output_base_dir, class_name)
-            os.makedirs(class_dir, exist_ok=True)
-            
-            if not pairs_chunk:
-                logger.warning(f"[Worker {thread_id}] Chunk {chunk_id} for class {class_name} is empty, returning 0")
-                return class_name, chunk_id, 0
-            
-            # Group pairs by file to process files sequentially
-            pairs_by_file = defaultdict(list)
-            for fidx, ridx in pairs_chunk:
-                pairs_by_file[fidx].append(ridx)
-            
-            logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Processing {len(pairs_by_file)} unique files")
-            
-            # Process in batches: accumulate vectors up to chunk_size, then write
-            current_chunk = []
-            sub_chunk_idx = 0
-            total_written = 0
-            files_processed = 0
-            
-            # Process each file sequentially
-            for fidx, row_indices in pairs_by_file.items():
-                try:
-                    path, _ = files_list[fidx]
-                    logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Opening file {fidx} ({os.path.basename(path)}) with {len(row_indices)} rows")
-                    file_start_time = time.time()
-                    
-                    # Use memory-mapped file - doesn't load into memory
-                    arr = np.load(path, mmap_mode="r")
-                    logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Loaded memmap for file {fidx}, shape={arr.shape}")
-                    
-                    # Process rows from this file in batches
-                    rows_processed = 0
-                    for ridx in row_indices:
-                        try:
-                            # Extract vector (creates a copy, but we process in small batches)
-                            vec = arr if arr.ndim == 1 else arr[ridx].copy()
-                            current_chunk.append(vec)
-                            rows_processed += 1
-                            
-                            # When batch is full, write it out and clear memory
-                            if len(current_chunk) >= chunk_size:
-                                chunk_data = np.stack(current_chunk, axis=0)
-                                # Use chunk_id in filename to ensure uniqueness across parallel workers
-                                chunk_path = os.path.join(class_dir, f"{class_name}.chunk{chunk_id:04d}.sub{sub_chunk_idx:03d}.npy")
-                                
-                                logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Writing sub-chunk {sub_chunk_idx} to {os.path.basename(chunk_path)} ({len(current_chunk)} samples)")
-                                write_start = time.time()
-                                np.save(chunk_path, chunk_data)
-                                write_time = time.time() - write_start
-                                logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Wrote sub-chunk {sub_chunk_idx} in {write_time:.2f}s")
-                                
-                                total_written += len(current_chunk)
-                                sub_chunk_idx += 1
-                                # Clear memory
-                                del chunk_data
-                                current_chunk = []
-                                # Force garbage collection periodically
-                                if sub_chunk_idx % 10 == 0:
-                                    gc.collect()
-                                    logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Garbage collected after {sub_chunk_idx} sub-chunks")
-                        except Exception as e:
-                            logger.error(f"[Worker {thread_id}] ERROR processing row {ridx} in file {fidx} (chunk {chunk_id}): {e}", exc_info=True)
-                            raise
-                    
-                    file_time = time.time() - file_start_time
-                    logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Processed file {fidx} ({rows_processed} rows) in {file_time:.2f}s")
-                    
-                    # Close memory map for this file
-                    del arr
-                    files_processed += 1
-                    
-                except Exception as e:
-                    logger.error(f"[Worker {thread_id}] ERROR processing file {fidx} (chunk {chunk_id}): {e}", exc_info=True)
-                    raise
-            
-            # Write remaining data
-            has_final_chunk = bool(current_chunk)
-            if current_chunk:
-                chunk_data = np.stack(current_chunk, axis=0)
-                chunk_path = os.path.join(class_dir, f"{class_name}.chunk{chunk_id:04d}.sub{sub_chunk_idx:03d}.npy")
-                logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Writing final sub-chunk {sub_chunk_idx} ({len(current_chunk)} samples)")
-                np.save(chunk_path, chunk_data)
-                total_written += len(current_chunk)
-                del chunk_data, current_chunk
-                logger.debug(f"[Worker {thread_id}] Chunk {chunk_id}: Wrote final sub-chunk")
-            
-            # Final garbage collection
-            gc.collect()
-            
-            elapsed_time = time.time() - start_time
-            total_sub_chunks = sub_chunk_idx + (1 if has_final_chunk else 0)
-            logger.info(f"[Worker {thread_id}] Chunk {chunk_id} for class {class_name} COMPLETED: {total_written} samples written, {files_processed} files processed, {total_sub_chunks} sub-chunks, took {elapsed_time:.2f}s")
-            
-            return class_name, chunk_id, total_written
-            
-        except Exception as e:
-            elapsed_time = time.time() - start_time
-            logger.error(f"[Worker {thread_id}] Chunk {chunk_id} for class {class_name} FAILED after {elapsed_time:.2f}s: {e}", exc_info=True)
-            raise
-    
-    # Use provided num_workers (should follow same logic as data loading: at least 2, or half CPUs)
-    # If None, default to same logic as data loading workers
-    if num_workers is None:
-        import multiprocessing
-        cpu_count = multiprocessing.cpu_count()
-        num_workers = max(2, min(4, cpu_count // 2))  # At least 2, or half CPUs, capped at 4
-    num_workers = max(1, num_workers)  # At least 1 worker
-    
-    print(f"Using {num_workers} worker thread(s) for parallel processing")
-    
-    # Prepare file list for workers (thread-safe - just paths)
-    files_list = base.files
-    
-    # Write train and test data - process classes AND chunks within classes in parallel
-    def process_classes_parallel(class_data_dict, output_dir, split_name):
-        """
-        Process multiple classes in parallel, with each class split into chunks
-        that are also processed in parallel. This enables parallelization even for
-        a single class.
-        
-        Args:
-            class_data_dict: Dict mapping class_name -> list of (fidx, ridx) pairs
-            output_dir: Output directory for split files
-            split_name: Name of split (e.g., "train", "test")
-            
-        Returns:
-            Dict mapping class_name -> total count of samples written
-        """
-        logger.info(f"[{split_name.upper()}] Starting parallel processing")
-        start_time = time.time()
-        counts = {}
-        
-        # Calculate chunk size for splitting pairs within a class
-        # Target: split each class into approximately num_workers chunks
-        # This ensures we can utilize all workers even with a single class
-        # Use a minimum chunk size to avoid too many small chunks
-        min_pairs_per_chunk = 1000  # Minimum pairs per chunk to avoid overhead
-        
-        logger.info(f"[{split_name.upper()}] Chunking strategy: min_pairs_per_chunk={min_pairs_per_chunk}, num_workers={num_workers}")
-        
-        # Prepare tasks: split each class into chunks
-        tasks = []
-        global_chunk_id = 0  # Global counter for unique chunk IDs across all classes
-        
-        for class_name in base.classes:
-            if class_name not in class_data_dict:
-                logger.debug(f"[{split_name.upper()}] Skipping class {class_name} (not in class_data_dict)")
-                continue
-            
-            pairs = class_data_dict[class_name]
-            if not pairs:
-                logger.debug(f"[{split_name.upper()}] Skipping class {class_name} (empty pairs list)")
-                continue
-            
-            # Calculate number of chunks for this class
-            # Aim for roughly num_workers chunks per class, but respect minimum chunk size
-            n_pairs = len(pairs)
-            target_chunks = max(1, min(num_workers * 2, n_pairs // min_pairs_per_chunk))
-            # Ensure at least one chunk, but don't create more chunks than pairs
-            n_chunks = max(1, min(target_chunks, n_pairs))
-            
-            logger.info(f"[{split_name.upper()}] Class {class_name}: {n_pairs} pairs -> {n_chunks} chunks")
-            
-            # Split pairs into chunks
-            chunk_size_pairs = max(1, n_pairs // n_chunks)
-            for chunk_idx in range(n_chunks):
-                start_idx = chunk_idx * chunk_size_pairs
-                end_idx = (chunk_idx + 1) * chunk_size_pairs if chunk_idx < n_chunks - 1 else n_pairs
-                pairs_chunk = pairs[start_idx:end_idx]
-                
-                if pairs_chunk:  # Only add non-empty chunks
-                    tasks.append((
-                        class_name,
-                        pairs_chunk,
-                        global_chunk_id,
-                        output_dir,
-                        files_list,
-                        chunk_size
-                    ))
-                    logger.debug(f"[{split_name.upper()}] Created task {global_chunk_id} for class {class_name} chunk {chunk_idx} ({len(pairs_chunk)} pairs)")
-                    global_chunk_id += 1
-        
-        if not tasks:
-            logger.warning(f"[{split_name.upper()}] No tasks created, returning empty counts")
-            return counts
-        
-        n_classes = len([c for c in base.classes if c in class_data_dict])
-        logger.info(f"[{split_name.upper()}] Created {len(tasks)} parallel tasks across {n_classes} class(es)")
-        print(f"  Created {len(tasks)} parallel tasks across {n_classes} class(es)")
-        
-        # Process all chunks in parallel (across all classes)
-        logger.info(f"[{split_name.upper()}] Starting ThreadPoolExecutor with {num_workers} workers")
-        executor_start_time = time.time()
-        
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all tasks
-            logger.info(f"[{split_name.upper()}] Submitting {len(tasks)} tasks to executor...")
-            submit_start = time.time()
-            future_to_task = {}
-            for task_idx, task in enumerate(tasks):
-                future = executor.submit(write_class_chunk_worker, task)
-                future_to_task[future] = task
-                if (task_idx + 1) % 10 == 0 or task_idx == len(tasks) - 1:
-                    logger.debug(f"[{split_name.upper()}] Submitted {task_idx + 1}/{len(tasks)} tasks")
-            
-            submit_time = time.time() - submit_start
-            logger.info(f"[{split_name.upper()}] All {len(tasks)} tasks submitted in {submit_time:.2f}s")
-            
-            # Track counts per class (may have multiple chunks per class)
-            class_counts = defaultdict(int)
-            
-            # Track active futures for status reporting
-            active_futures = set(future_to_task.keys())
-            last_status_time = time.time()
-            status_interval = 30.0  # Report status every 30 seconds
-            
-            # Collect results as they complete
-            completed_chunks = 0
-            failed_chunks = 0
-            logger.info(f"[{split_name.upper()}] Waiting for {len(tasks)} tasks to complete...")
-            
-            try:
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    class_name = task[0]
-                    chunk_id = task[2]
-                    active_futures.discard(future)
-                    
-                    current_time = time.time()
-                    elapsed_since_submit = current_time - executor_start_time
-                    
-                    try:
-                        result_class, result_chunk_id, count = future.result()
-                        class_counts[result_class] += count
-                        completed_chunks += 1
-                        
-                        # Log every completion (can be verbose, but helpful for debugging)
-                        logger.info(f"[{split_name.upper()}] Chunk {chunk_id} ({class_name}) completed: {count} samples, "
-                                   f"progress: {completed_chunks}/{len(tasks)} ({100*completed_chunks/len(tasks):.1f}%), "
-                                   f"elapsed: {elapsed_since_submit:.1f}s, active: {len(active_futures)}")
-                        
-                        # Print progress every 10% of chunks
-                        if count > 0 and completed_chunks % max(1, len(tasks) // 10) == 0:
-                            print(f"    Progress: {completed_chunks}/{len(tasks)} chunks completed ({100*completed_chunks/len(tasks):.1f}%)")
-                            logger.info(f"[{split_name.upper()}] Progress milestone: {completed_chunks}/{len(tasks)} chunks completed")
-                        
-                    except Exception as e:
-                        failed_chunks += 1
-                        logger.error(f"[{split_name.upper()}] ERROR processing {class_name} chunk {chunk_id}: {e}", exc_info=True)
-                        print(f"    ERROR processing {class_name} chunk {chunk_id}: {e}")
-                        raise
-                    
-                    # Periodic status report if processing is taking a while
-                    if current_time - last_status_time >= status_interval:
-                        remaining = len(tasks) - completed_chunks - failed_chunks
-                        logger.info(f"[{split_name.upper()}] Status: {completed_chunks} completed, {failed_chunks} failed, "
-                                   f"{remaining} remaining, {len(active_futures)} active futures, "
-                                   f"elapsed: {elapsed_since_submit:.1f}s")
-                        last_status_time = current_time
-                
-                total_time = time.time() - executor_start_time
-                logger.info(f"[{split_name.upper()}] All tasks completed: {completed_chunks} succeeded, {failed_chunks} failed, "
-                           f"total time: {total_time:.2f}s")
-                
-            except KeyboardInterrupt:
-                logger.error(f"[{split_name.upper()}] Interrupted by user")
-                print(f"    Interrupted by user")
-                raise
-            except Exception as e:
-                logger.error(f"[{split_name.upper()}] Fatal error in parallel processing: {e}", exc_info=True)
-                logger.error(f"[{split_name.upper()}] Completed: {completed_chunks}, Failed: {failed_chunks}, "
-                           f"Remaining: {len(tasks) - completed_chunks - failed_chunks}, "
-                           f"Active futures: {len(active_futures)}")
-                raise
-        
-        # Convert defaultdict to regular dict and print summary
-        for class_name, total_count in class_counts.items():
-            counts[class_name] = total_count
-            if total_count > 0:
-                logger.info(f"[{split_name.upper()}] Class {class_name}: {total_count} total samples written")
-                print(f"    {class_name}: {total_count} samples written")
-        
-        total_elapsed = time.time() - start_time
-        logger.info(f"[{split_name.upper()}] Parallel processing completed in {total_elapsed:.2f}s")
-        
-        return counts
-    
+
     logger.info("="*70)
-    logger.info("Starting to write split files")
+    logger.info("Writing split files (single write per class, parallelized)")
     logger.info("="*70)
-    
-    print("Writing train split files...")
-    logger.info("Calling process_classes_parallel for TRAIN split...")
-    train_counts = process_classes_parallel(train_by_class, train_dir, "train")
-    logger.info("TRAIN split writing completed")
-    # Clear train_by_class completely
-    del train_by_class
+
+    split_dirs = {"train": train_dir, "test": test_dir}
+
+    def write_class_split(split_name: str, class_name: str, samples_list: List[np.ndarray]):
+        base_split_dir = split_dirs[split_name]
+        class_dir = os.path.join(base_split_dir, class_name)
+        os.makedirs(class_dir, exist_ok=True)
+        logger.debug(
+            f"[writer] {split_name.upper()} - {class_name}: concatenating {len(samples_list)} arrays"
+        )
+        data = (
+            np.concatenate(samples_list, axis=0)
+            if len(samples_list) > 1
+            else samples_list[0]
+        )
+        out_path = os.path.join(class_dir, f"{class_name}.npy")
+        np.save(out_path, data)
+        logger.info(
+            f"  {split_name.upper()} - {class_name}: {data.shape[0]} samples written to {out_path}"
+        )
+        for arr in samples_list:
+            del arr
+
+    write_futures = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for split_name, class_data in split_storage.items():
+            logger.info(f"Writing {split_name} split to disk...")
+            for class_name, samples_list in list(class_data.items()):
+                if not samples_list:
+                    logger.debug(
+                        f"  {split_name.upper()} - {class_name}: no samples, skipping file write"
+                    )
+                    continue
+                write_futures.append(
+                    executor.submit(write_class_split, split_name, class_name, samples_list)
+                )
+        for future in as_completed(write_futures):
+            future.result()
+
+    for class_data in split_storage.values():
+        class_data.clear()
     gc.collect()
-    logger.debug("Freed memory after train split writing")
-    
-    print("Writing test split files...")
-    logger.info("Calling process_classes_parallel for TEST split...")
-    test_counts = process_classes_parallel(test_by_class, test_dir, "test")
-    logger.info("TEST split writing completed")
-    # Clear test_by_class completely
-    del test_by_class
-    gc.collect()
-    logger.debug("Freed memory after test split writing")
-    
-    # Save metadata
+
+    train_counts = {cls: split_counts["train"].get(cls, 0) for cls in base.classes}
+    test_counts = {cls: split_counts["test"].get(cls, 0) for cls in base.classes}
+
     logger.info("Saving metadata...")
     metadata = {
         "created_at": datetime.utcnow().isoformat() + "Z",
@@ -774,13 +514,13 @@ def create_flow_split_dataset_files(
         "total_train": sum(train_counts.values()),
         "total_test": sum(test_counts.values()),
     }
-    
+
     metadata_path = os.path.join(output_root, "flow_split_metadata.json")
     logger.info(f"Writing metadata to {metadata_path}")
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info("Metadata saved successfully")
-    
+
     total_time = time.time() - function_start_time
     logger.info("="*70)
     logger.info("create_flow_split_dataset_files COMPLETED")
@@ -791,15 +531,16 @@ def create_flow_split_dataset_files(
     logger.info(f"  Total test samples: {sum(test_counts.values())}")
     logger.info(f"  Total time: {total_time:.2f}s")
     logger.info("="*70)
-    
-    print(f"\nFlow-split dataset created:")
+
+    print("\nFlow-split dataset created:")
     print(f"  Train: {train_dir}")
     print(f"  Test: {test_dir}")
     print(f"  Metadata: {metadata_path}")
     print(f"  Total train samples: {sum(train_counts.values())}")
     print(f"  Total test samples: {sum(test_counts.values())}")
-    
+
     return train_dir, test_dir
+
 
 
 def has_pre_split_dataset(root: str) -> bool:
