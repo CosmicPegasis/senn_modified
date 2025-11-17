@@ -59,3 +59,4 @@ dist/
 *.npy
 pcaps/
 .cursor/
+CIC-IDS-2017/
