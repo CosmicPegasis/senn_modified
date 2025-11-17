@@ -61,3 +61,4 @@ pcaps/
 .cursor/
 CIC-IDS-2017/
 flow*.json
+*feature_importance*
