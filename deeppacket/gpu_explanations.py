@@ -2,7 +2,7 @@
 
 This module provides memory-efficient, GPU-accelerated explanation generation
 for GSENN models, with the following optimizations:
-- Pre-loads all data into GPU memory (avoiding repeated file I/O)
+- Streams batches from existing RAM-resident datasets (avoiding duplicate copies)
 - Batched processing for GPU efficiency
 - Progress bars for monitoring
 - Generates explanations for train+val+test sets
@@ -15,7 +15,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import gc
 
 logger = logging.getLogger(__name__)
 
@@ -53,64 +52,86 @@ class GPUExplanationGenerator:
         logger.info(f"  Batch size: {self.batch_size}")
         logger.info(f"  Skip bias: {self.skip_bias}")
 
-    def _preload_dataset(
+    def _generate_explanations_from_loader(
         self,
         data_loader: DataLoader,
         dataset_name: str,
         max_samples: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, np.ndarray]:
         """
-        Pre-load entire dataset into GPU memory.
+        Stream explanations directly from an existing DataLoader without duplicating data.
 
         Args:
-            data_loader: DataLoader to load from
+            data_loader: DataLoader configured over datasets that are already resident in RAM
             dataset_name: Name for logging (e.g., 'train', 'val', 'test')
-            max_samples: Maximum samples to load (None = all)
+            max_samples: Maximum samples to process (None = all)
 
         Returns:
-            Tuple of (inputs, targets) as tensors on device
+            Dictionary containing attributions, predictions, and targets as numpy arrays.
         """
-        logger.info(f"Pre-loading {dataset_name} dataset into memory...")
+        logger.info(f"\nGenerating explanations for {dataset_name} set from existing loader...")
 
-        all_inputs = []
-        all_targets = []
-        total_samples = 0
+        processed_samples = 0
+        all_attributions: List[np.ndarray] = []
+        all_predictions: List[np.ndarray] = []
+        all_targets: List[np.ndarray] = []
 
-        # Use tqdm for progress bar
         with tqdm(
             data_loader,
-            desc=f"Loading {dataset_name} data",
+            desc=f"Streaming {dataset_name} batches",
             unit="batch",
             ncols=100
         ) as pbar:
             for inputs, targets in pbar:
-                # Add to lists
-                all_inputs.append(inputs.cpu())  # Keep on CPU initially to save GPU memory
-                all_targets.append(targets.cpu())
+                batch_size = inputs.size(0)
 
-                total_samples += len(inputs)
-                pbar.set_postfix({"samples": total_samples})
+                if max_samples is not None:
+                    remaining = max_samples - processed_samples
+                    if remaining <= 0:
+                        break
+                    if batch_size > remaining:
+                        inputs = inputs[:remaining]
+                        targets = targets[:remaining]
+                        batch_size = remaining
 
-                # Check if we've reached max_samples
-                if max_samples is not None and total_samples >= max_samples:
-                    logger.info(f"Reached max_samples limit ({max_samples})")
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+
+                attributions, predictions, targets_np = self._generate_batch_explanations(
+                    inputs, targets
+                )
+
+                all_attributions.append(attributions)
+                all_predictions.append(predictions)
+                all_targets.append(targets_np)
+
+                processed_samples += batch_size
+                pbar.set_postfix({"samples": processed_samples})
+
+                del inputs, targets
+                if processed_samples % (self.batch_size * 10) == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                if max_samples is not None and processed_samples >= max_samples:
                     break
 
-        # Concatenate all batches
-        logger.info(f"Concatenating {len(all_inputs)} batches...")
-        inputs_tensor = torch.cat(all_inputs, dim=0)
-        targets_tensor = torch.cat(all_targets, dim=0)
+        if not all_attributions:
+            logger.warning(f"No samples processed for {dataset_name}. Returning empty results.")
+            return {
+                'attributions': np.zeros((0, 0), dtype=np.float32),
+                'predictions': np.zeros((0,), dtype=np.int64),
+                'targets': np.zeros((0,), dtype=np.int64),
+            }
 
-        # Truncate if needed
-        if max_samples is not None and len(inputs_tensor) > max_samples:
-            inputs_tensor = inputs_tensor[:max_samples]
-            targets_tensor = targets_tensor[:max_samples]
+        results = {
+            'attributions': np.concatenate(all_attributions, axis=0),
+            'predictions': np.concatenate(all_predictions, axis=0),
+            'targets': np.concatenate(all_targets, axis=0),
+        }
 
-        logger.info(f"Loaded {len(inputs_tensor)} samples from {dataset_name} set")
-        logger.info(f"  Input shape: {inputs_tensor.shape}")
-        logger.info(f"  Memory: {inputs_tensor.element_size() * inputs_tensor.nelement() / 1024**3:.2f} GB")
-
-        return inputs_tensor, targets_tensor
+        logger.info(f"Generated {len(results['attributions'])} {dataset_name} explanations without extra CPU copies")
+        logger.info(f"  Attribution shape: {results['attributions'].shape}")
+        return results
 
     def _generate_batch_explanations(
         self,
@@ -290,23 +311,12 @@ class GPUExplanationGenerator:
                 continue
 
             try:
-                # Pre-load dataset
-                inputs_tensor, targets_tensor = self._preload_dataset(
-                    data_loader, dataset_name, max_samples
+                dataset_results = self._generate_explanations_from_loader(
+                    data_loader=data_loader,
+                    dataset_name=dataset_name,
+                    max_samples=max_samples,
                 )
-
-                # Generate explanations
-                dataset_results = self.generate_explanations(
-                    inputs_tensor, targets_tensor, dataset_name
-                )
-
                 results[dataset_name] = dataset_results
-
-                # Free memory
-                del inputs_tensor, targets_tensor
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
             except Exception as e:
                 logger.error(f"Error processing {dataset_name} set: {e}")
