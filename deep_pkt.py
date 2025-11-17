@@ -68,6 +68,7 @@ from deeppacket import (
     load_pre_split_dataset,
     run_comprehensive_flow_checks,
     get_dataset_classes,
+    GPUExplanationGenerator,
 )
 
 # Optional imports for feature explanations
@@ -131,8 +132,12 @@ def build_args() -> TrainArgs:
             "  python deep_pkt.py --root proc_pcaps/ --flow_split --epochs 20 --cuda\n\n"
             "  # Training with class imbalance handling:\n"
             "  python deep_pkt.py --root proc_pcaps/ --handle_imbalance --undersample --cuda\n\n"
-            "  # Training with feature explanations:\n"
-            "  python deep_pkt.py --root proc_pcaps/ --use_shap --use_lime --cuda"
+            "  # GPU-optimized GSENN explanations (fast, all datasets):\n"
+            "  python deep_pkt.py --root proc_pcaps/ --use_gpu_explanations --cuda\n\n"
+            "  # GPU explanations with custom batch size:\n"
+            "  python deep_pkt.py --root proc_pcaps/ --use_gpu_explanations --explanation_batch_size 512 --cuda\n\n"
+            "  # Legacy explanations (slow, limited samples):\n"
+            "  python deep_pkt.py --root proc_pcaps/ --use_gsenn --use_shap --use_lime --cuda"
         )
     )
     parser.add_argument("--root", type=str, default="proc_pcaps/", 
@@ -196,6 +201,13 @@ def build_args() -> TrainArgs:
         help="Enable SHAP explanations (requires shap package). Disabled by default.")
     parser.add_argument("--use_lime", action="store_true", default=False,
         help="Enable LIME explanations (requires lime package). Disabled by default.")
+    parser.add_argument("--use_gpu_explanations", action="store_true", default=False,
+        help="Use GPU-optimized batch explanation generation (faster, uses more memory). "
+             "Automatically enables GSENN and generates explanations for train+val+test sets.")
+    parser.add_argument("--explanation_batch_size", type=int, default=256,
+        help="Batch size for GPU explanation generation (default: 256)")
+    parser.add_argument("--max_explanation_samples", type=int, default=None,
+        help="Max samples per dataset for explanations (None = all, useful to limit memory)")
     parser.add_argument("--num_workers", type=int, default=None,
         help="Number of data loading workers (default: auto-detect based on CPU count, min 2)")
     parser.add_argument("--log_level", type=str, default="INFO",
@@ -255,7 +267,10 @@ def build_args() -> TrainArgs:
     args.use_gsenn = args_ns.use_gsenn  # type: ignore[attr-defined]
     args.use_shap = args_ns.use_shap  # type: ignore[attr-defined]
     args.use_lime = args_ns.use_lime  # type: ignore[attr-defined]
-    
+    args.use_gpu_explanations = args_ns.use_gpu_explanations  # type: ignore[attr-defined]
+    args.explanation_batch_size = args_ns.explanation_batch_size  # type: ignore[attr-defined]
+    args.max_explanation_samples = args_ns.max_explanation_samples  # type: ignore[attr-defined]
+
     # Auto-detect num_workers if not specified
     if args_ns.num_workers is None:
         import multiprocessing
@@ -520,14 +535,39 @@ def main():
         typ = {"grad1": 1, "grad2": 2, "grad3": 3}.get(args.theta_reg_type, 3)
         trainer = GradPenaltyTrainer(model, args, typ=typ)
 
+    # Try to load existing checkpoint
+    checkpoint_path = os.path.join(model_path, "model_best.pth.tar")
+    if os.path.exists(checkpoint_path):
+        logger.info("="*70)
+        logger.info(f"Found existing checkpoint: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            trainer.model.load_state_dict(checkpoint['state_dict'])
+            logger.info(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            logger.info(f"✓ Best validation accuracy: {checkpoint.get('best_prec1', 'unknown'):.2f}%")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            logger.info("Continuing with fresh model...")
+        logger.info("="*70)
+    else:
+        logger.info("="*70)
+        logger.info("No checkpoint found at: " + checkpoint_path)
+        logger.info("Will start with fresh model weights")
+        logger.info("="*70)
+
     # Train & evaluate
-    logger.info("="*70)
-    logger.info("Starting training")
-    logger.info(f"  Epochs: {args.epochs}")
-    logger.info(f"  Model path: {model_path}")
-    logger.info("="*70)
-    
-    trainer.train(train_loader, valid_loader, epochs=args.epochs, save_path=model_path)
+    if args.epochs > 0:
+        logger.info("="*70)
+        logger.info("Starting training")
+        logger.info(f"  Epochs: {args.epochs}")
+        logger.info(f"  Model path: {model_path}")
+        logger.info("="*70)
+        trainer.train(train_loader, valid_loader, epochs=args.epochs, save_path=model_path)
+    else:
+        logger.info("="*70)
+        logger.info("Skipping training (epochs=0). Using loaded model for evaluation/explanations.")
+        logger.info("="*70)
+
     device = torch.device("cuda" if (args.cuda and torch.cuda.is_available()) else "cpu")
     logger.info(f"Moving model to device: {device}")
     trainer.model.to(device)
@@ -625,9 +665,114 @@ def main():
                 print(cm)
         else:
             print("\nWarning: sklearn.metrics not available. Skipping confusion matrix and classification report.")
-        
-        # Generate global feature explanations (aggregated per class)
-        if HAS_ROBUST_INTERPRET:
+
+        # GPU-optimized explanation generation (new fast path)
+        use_gpu_explanations = getattr(args, 'use_gpu_explanations', False)
+        if use_gpu_explanations:
+            print("\n" + "=" * 70)
+            print(" GPU-OPTIMIZED GSENN EXPLANATION GENERATION")
+            print("=" * 70)
+            print("Using GPU-accelerated batch processing for all datasets (train+val+test)")
+
+            # Initialize GPU explanation generator
+            explanation_batch_size = getattr(args, 'explanation_batch_size', 256)
+            max_explanation_samples = getattr(args, 'max_explanation_samples', None)
+
+            gpu_explainer = GPUExplanationGenerator(
+                model=trainer.model,
+                device=device,
+                batch_size=explanation_batch_size,
+                skip_bias=True,
+            )
+
+            # Generate explanations for all datasets
+            all_explanations = gpu_explainer.generate_all_explanations(
+                train_loader=train_loader if train_loader is not None else None,
+                val_loader=val_loader if val_loader is not None else None,
+                test_loader=test_loader if test_loader is not None else None,
+                max_train_samples=max_explanation_samples,
+                max_val_samples=max_explanation_samples,
+                max_test_samples=max_explanation_samples,
+            )
+
+            # Aggregate explanations by class for each dataset
+            print("\n" + "=" * 70)
+            print("Aggregating feature importance per class...")
+            print("=" * 70)
+
+            aggregated_by_dataset = {}
+            for dataset_name, explanations in all_explanations.items():
+                print(f"\nAggregating {dataset_name} explanations...")
+                aggregated = gpu_explainer.aggregate_explanations_by_class(
+                    explanations, class_names=classes
+                )
+                aggregated_by_dataset[dataset_name] = aggregated
+
+                # Print summary
+                for cls_idx, mean_attr in aggregated.items():
+                    n_samples = np.sum(explanations['targets'] == cls_idx)
+                    print(f"  Class {cls_idx} ({classes[cls_idx]}): {n_samples} samples")
+
+            # Visualize and save results
+            if HAS_MATPLOTLIB:
+                print("\n" + "=" * 70)
+                print("Visualizing global feature importance...")
+                print("=" * 70)
+
+                for dataset_name, aggregated in aggregated_by_dataset.items():
+                    for cls_idx, mean_attributions in aggregated.items():
+                        # Create visualization (top 20 most important bytes)
+                        importance = np.abs(mean_attributions)
+                        top_k = 20
+                        top_indices = np.argsort(importance)[-top_k:][::-1]
+                        top_values = importance[top_indices]
+
+                        plt.figure(figsize=(10, 6))
+                        plt.barh(range(top_k), top_values)
+                        plt.yticks(range(top_k), [f"byte_{i}" for i in top_indices])
+                        plt.xlabel('Absolute Attribution (Importance)')
+                        plt.title(f'Top {top_k} Important Bytes - {dataset_name} - {classes[cls_idx]}')
+                        plt.gca().invert_yaxis()
+                        plt.tight_layout()
+
+                        # Save plot
+                        plot_path = os.path.join(
+                            model_path,
+                            f'gsenn_gpu_{dataset_name}_class{cls_idx}_{classes[cls_idx]}_top{top_k}.png'
+                        )
+                        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                        plt.close()
+                        print(f"  Saved: {plot_path}")
+
+            # Save raw explanations and aggregations
+            print("\n" + "=" * 70)
+            print("Saving explanation results...")
+            print("=" * 70)
+
+            for dataset_name, explanations in all_explanations.items():
+                # Save raw explanations
+                np.savez_compressed(
+                    os.path.join(model_path, f'gsenn_gpu_{dataset_name}_raw.npz'),
+                    attributions=explanations['attributions'],
+                    predictions=explanations['predictions'],
+                    targets=explanations['targets'],
+                )
+                print(f"  Saved raw {dataset_name} explanations")
+
+                # Save aggregated explanations
+                aggregated = aggregated_by_dataset[dataset_name]
+                np.savez_compressed(
+                    os.path.join(model_path, f'gsenn_gpu_{dataset_name}_aggregated.npz'),
+                    **{f'class_{cls_idx}': mean_attr for cls_idx, mean_attr in aggregated.items()}
+                )
+                print(f"  Saved aggregated {dataset_name} explanations")
+
+            print("\n" + "=" * 70)
+            print("GPU-optimized explanation generation complete!")
+            print("=" * 70 + "\n")
+
+        # Legacy explanation generation (old slow path)
+        elif HAS_ROBUST_INTERPRET:
             print("\n" + "=" * 70)
             print(" GENERATING GLOBAL FEATURE EXPLANATIONS")
             print("=" * 70)

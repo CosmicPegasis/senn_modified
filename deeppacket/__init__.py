@@ -44,6 +44,10 @@ from .flow_utils import (
     _assert_no_flow_overlap_datasets,
 )
 
+from .gpu_explanations import (
+    GPUExplanationGenerator,
+)
+
 __all__ = [
     # Utils
     "set_seed",
@@ -79,5 +83,7 @@ __all__ = [
     "load_pre_split_dataset",
     "run_comprehensive_flow_checks",
     "_assert_no_flow_overlap_datasets",
+    # GPU Explanations
+    "GPUExplanationGenerator",
 ]
 
