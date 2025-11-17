@@ -1,0 +1,44 @@
+Bootstrap: docker
+From: docker.io/pytorch/pytorch:latest
+
+%labels
+    Author cosmic
+    Description "PyTorch latest + DeepPacket runtime deps (scapy, matplotlib, seaborn, sklearn)"
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%post
+    set -e
+    echo "Updating apt sources and installing system dependencies..."
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        curl \
+        ca-certificates \
+        libpcap-dev \
+        libgl1 \
+        pkg-config && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+    echo "Upgrading pip and installing Python requirements..."
+    pip install --no-cache-dir --upgrade pip
+    pip install --no-cache-dir \
+        numpy \
+        scipy \
+        scikit-learn \
+        matplotlib \
+        seaborn \
+        scapy \
+        tqdm \
+        pandas
+
+    echo "Container build complete."
+
+%runscript
+    exec "$@"
+
