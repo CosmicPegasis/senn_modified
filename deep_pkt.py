@@ -73,25 +73,11 @@ from deeppacket import (
 
 # Optional imports for feature explanations
 try:
-    from robust_interpret.explainers import gsenn_wrapper, shap_wrapper, lime_wrapper
+    from robust_interpret.explainers import gsenn_wrapper
     HAS_ROBUST_INTERPRET = True
 except ImportError:
     HAS_ROBUST_INTERPRET = False
     print("Warning: robust_interpret not available. Feature explanations will be skipped.")
-
-# Check if SHAP and LIME are available
-try:
-    import shap
-    HAS_SHAP = True
-except ImportError:
-    HAS_SHAP = False
-    print("Warning: SHAP not available. SHAP explanations will be skipped.")
-try:
-    import lime
-    HAS_LIME = True
-except ImportError:
-    HAS_LIME = False
-    print("Warning: LIME not available. LIME explanations will be skipped.")
 
 # Ignore ConvergenceWarning (if sklearn is available)
 try:
@@ -136,8 +122,8 @@ def build_args() -> TrainArgs:
             "  python deep_pkt.py --root proc_pcaps/ --use_gpu_explanations --cuda\n\n"
             "  # GPU explanations with custom batch size:\n"
             "  python deep_pkt.py --root proc_pcaps/ --use_gpu_explanations --explanation_batch_size 512 --cuda\n\n"
-            "  # Legacy explanations (slow, limited samples):\n"
-            "  python deep_pkt.py --root proc_pcaps/ --use_gsenn --use_shap --use_lime --cuda"
+            "  # Legacy GSENN explanations on CPU:\n"
+            "  python deep_pkt.py --root proc_pcaps/ --use_gsenn --cuda"
         )
     )
     parser.add_argument("--root", type=str, default="proc_pcaps/", 
@@ -197,10 +183,6 @@ def build_args() -> TrainArgs:
         help="Skip checking for pre-split dataset and use legacy flow_split behavior.")
     parser.add_argument("--use_gsenn", action="store_true", default=False,
         help="Enable GSENN explanations. Disabled by default.")
-    parser.add_argument("--use_shap", action="store_true", default=False,
-        help="Enable SHAP explanations (requires shap package). Disabled by default.")
-    parser.add_argument("--use_lime", action="store_true", default=False,
-        help="Enable LIME explanations (requires lime package). Disabled by default.")
     parser.add_argument("--use_gpu_explanations", action="store_true", default=False,
         help="Use GPU-optimized batch explanation generation (faster, uses more memory). "
              "Automatically enables GSENN and generates explanations for train+val+test sets.")
@@ -265,8 +247,6 @@ def build_args() -> TrainArgs:
     args.pre_split_output = args_ns.pre_split_output  # type: ignore[attr-defined]
     args.skip_pre_split_check = args_ns.skip_pre_split_check  # type: ignore[attr-defined]
     args.use_gsenn = args_ns.use_gsenn  # type: ignore[attr-defined]
-    args.use_shap = args_ns.use_shap  # type: ignore[attr-defined]
-    args.use_lime = args_ns.use_lime  # type: ignore[attr-defined]
     args.use_gpu_explanations = args_ns.use_gpu_explanations  # type: ignore[attr-defined]
     args.explanation_batch_size = args_ns.explanation_batch_size  # type: ignore[attr-defined]
     args.max_explanation_samples = args_ns.max_explanation_samples  # type: ignore[attr-defined]
@@ -833,17 +813,10 @@ def main():
         print(" GENERATING GLOBAL FEATURE EXPLANATIONS")
         print("=" * 70)
         use_gsenn_flag = getattr(args, 'use_gsenn', False)
-        use_shap_flag = getattr(args, 'use_shap', False)
-        use_lime_flag = getattr(args, 'use_lime', False)
         enabled_methods = []
         if use_gsenn_flag:
             enabled_methods.append("GSENN")
-        if HAS_SHAP and use_shap_flag:
-            enabled_methods.append("SHAP")
-        if HAS_LIME and use_lime_flag:
-            enabled_methods.append("LIME")
         
-        # Warn if GSENN is disabled
         if not use_gsenn_flag:
             print("WARNING: GSENN explanations are disabled by default. Use --use_gsenn to enable them.")
             warnings.warn(
@@ -854,60 +827,17 @@ def main():
         
         if not enabled_methods:
             print("WARNING: No explanation methods enabled. Skipping feature explanations.")
-            print("         Use --use_gsenn, --use_shap, or --use_lime to enable explanations.")
+            print("         Use --use_gsenn to enable GSENN explanations.")
             print("=" * 70 + "\n")
         else:
             print("INFO: Processing samples in small batches to control memory usage.")
             print(f"      Enabled methods: {', '.join(enabled_methods)}")
-            print("      Total samples per class: GSENN=100, SHAP=50, LIME=50")
+            print("      Total samples per class: GSENN=100")
             print("=" * 70 + "\n")
         
         # Create feature names for packet bytes (0-1499)
         feature_names = [f"byte_{i}" for i in range(1500)]
         class_names = classes
-        
-        # Prepare training data for SHAP/LIME (need numpy arrays) - LIMIT SIZE
-        print("Preparing training data for explainers (limiting to 5000 samples for memory)...")
-        train_data_list = []
-        train_labels_list = []
-        max_train_samples = 5000
-        sample_count = 0
-        for inputs, targets in train_loader:
-            if sample_count >= max_train_samples:
-                break
-            x_np = inputs.squeeze().cpu().numpy()  # (B, 1500)
-            y_np = targets.cpu().numpy()
-            # Only take what we need
-            remaining = max_train_samples - sample_count
-            if len(x_np) > remaining:
-                x_np = x_np[:remaining]
-                y_np = y_np[:remaining]
-            train_data_list.append(x_np)
-            train_labels_list.append(y_np)
-            sample_count += len(x_np)
-        X_train = np.concatenate(train_data_list, axis=0) if train_data_list else np.array([])
-        y_train = np.concatenate(train_labels_list, axis=0) if train_labels_list else np.array([])
-        print(f"  Prepared {len(X_train)} training samples (limited for memory)")
-        # Clear intermediate lists
-        del train_data_list, train_labels_list
-        gc.collect()
-        
-        # Create model wrapper function for SHAP/LIME
-        def model_predict_proba(x):
-            """Wrapper for model.predict_proba that SHAP/LIME can use."""
-            if isinstance(x, np.ndarray):
-                x_tensor = torch.from_numpy(x).float()
-            else:
-                x_tensor = x.float()
-            
-            # Reshape to (B, 1, 1, 1500) if needed
-            if x_tensor.dim() == 2:
-                x_tensor = x_tensor.unsqueeze(1).unsqueeze(1)
-            
-            trainer.model.eval()
-            with torch.no_grad():
-                probs = trainer.model.predict_proba(x_tensor, to_numpy=True)
-            return probs
         
         # Initialize explainers
         explainers = {}
@@ -929,97 +859,6 @@ def main():
                 skip_bias=True,
                 verbose=False
             )
-        
-        # SHAP explainer (if available and enabled) - MEMORY OPTIMIZED
-        use_shap_flag = getattr(args, 'use_shap', False)
-        has_shap_local = HAS_SHAP and use_shap_flag
-        if not has_shap_local:
-            if not use_shap_flag:
-                print("Skipping SHAP explanations (disabled by default, use --use_shap to enable)")
-            elif not HAS_SHAP:
-                print("Skipping SHAP explanations (shap package not available)")
-        if has_shap_local:
-            print("Creating SHAP explainer (MEMORY-OPTIMIZED: small background set)...")
-            try:
-                # Use a VERY small subset of training data for SHAP background to save memory
-                n_background = min(10, len(X_train))  # Reduced from 100 to 10
-                background_indices = np.random.choice(len(X_train), n_background, replace=False)
-                X_background = X_train[background_indices].copy()
-                y_background = y_train[background_indices].copy()
-                
-                explainers['SHAP'] = shap_wrapper(
-                    model_predict_proba,
-                    shap_type='kernel',
-                    link='identity',
-                    mode='classification',
-                    multiclass=(args.nclasses > 2),
-                    feature_names=feature_names,
-                    class_names=class_names,
-                    train_data=(X_background, y_background),
-                    nsamples=50,  # Reduced from 100 to 50 for memory
-                    verbose=False
-                )
-                print("  SHAP explainer created successfully (memory-optimized)")
-                # Clear background data from memory
-                del X_background, y_background, background_indices
-                gc.collect()
-            except Exception as e:
-                print(f"  Warning: Could not create SHAP explainer: {e}")
-                print(f"  SHAP is memory-intensive. Consider skipping it or reducing dataset size.")
-                has_shap_local = False
-                if 'SHAP' in explainers:
-                    del explainers['SHAP']
-                gc.collect()
-        
-        # LIME explainer (if available and enabled) - MEMORY OPTIMIZED
-        use_lime_flag = getattr(args, 'use_lime', False)
-        has_lime_local = HAS_LIME and use_lime_flag
-        if not has_lime_local:
-            if not use_lime_flag:
-                print("Skipping LIME explanations (disabled by default, use --use_lime to enable)")
-            elif not HAS_LIME:
-                print("Skipping LIME explanations (lime package not available)")
-        if has_lime_local:
-            print("Creating LIME explainer (MEMORY-OPTIMIZED: limited training data)...")
-            try:
-                # Use a smaller subset for LIME training data to save memory
-                n_lime_train = min(1000, len(X_train))  # Limit to 1000 samples
-                lime_indices = np.random.choice(len(X_train), n_lime_train, replace=False)
-                X_lime_train = X_train[lime_indices].copy()
-                y_lime_train = y_train[lime_indices].copy()
-                
-                explainers['LIME'] = lime_wrapper(
-                    model_predict_proba,
-                    lime_type='tabular',
-                    mode='classification',
-                    multiclass=(args.nclasses > 2),
-                    feature_names=feature_names,
-                    class_names=class_names,
-                    train_data=(X_lime_train, y_lime_train),
-                    num_samples=500,  # Reduced from 1000 to 500 for memory
-                    num_features=1500,  # All features
-                    verbose=False
-                )
-                print("  LIME explainer created successfully (memory-optimized)")
-                # Clear LIME training data from memory
-                del X_lime_train, y_lime_train, lime_indices
-                gc.collect()
-            except Exception as e:
-                print(f"  Warning: Could not create LIME explainer: {e}")
-                print(f"  LIME is memory-intensive. Consider skipping it or reducing dataset size.")
-                has_lime_local = False
-                if 'LIME' in explainers:
-                    del explainers['LIME']
-                gc.collect()
-        
-        # Clear training data arrays now that explainers are created (they have their own copies)
-        try:
-            del X_train, y_train
-            gc.collect()
-            print("Cleared training data arrays from memory")
-        except NameError:
-            pass  # Already deleted or never created
-        
         def collect_explanations_for_dataset(data_loader, dataset_name, explainer_name, explainer, 
                                              max_samples_per_class=None, batch_process_size=10,
                                              max_batches=None):
@@ -1103,198 +942,62 @@ def main():
                         x_sub_batch = x_batch_np[sub_indices]
                         targets_sub = targets_np[sub_indices]
                         
-                        # Get predicted classes for SHAP/LIME (use predicted class for explanations)
-                        predicted_classes_sub = None
-                        if explainer_name in ['SHAP', 'LIME']:
-                            # Get predictions for this sub-batch
-                            x_sub_batch_tensor = torch.from_numpy(x_sub_batch).float().to(device)
-                            # Reshape to (B, 1, 1, 1500) if needed
-                            if x_sub_batch_tensor.dim() == 2:
-                                x_sub_batch_tensor = x_sub_batch_tensor.unsqueeze(1).unsqueeze(1)
-                            
-                            trainer.model.eval()
-                            with torch.no_grad():
-                                logits = trainer.model(x_sub_batch_tensor)
-                                # Use argmax for all cases (works for both binary nclasses=2 and multiclass)
-                                preds = logits.argmax(dim=1).view(-1)
-                            predicted_classes_sub = preds.cpu().numpy()
-                            del x_sub_batch_tensor, logits, preds
-                        
                         # Generate explanations for this sub-batch
                         try:
-                            # Get attributions for samples in sub-batch
-                            # GSENN uses true class labels; SHAP/LIME use predicted class labels
-                            if explainer_name == 'GSENN':
-                                attributions = explainer(x_sub_batch, y=targets_sub, show_plot=False)
-                            elif explainer_name == 'SHAP':
-                                # SHAP: Process samples in small sub-batch, store directly
-                                # Use PREDICTED class for explanations (not true class)
-                                attributions = []
-                                for i in range(len(targets_sub)):
-                                    true_cls_idx = int(targets_sub[i])
-                                    pred_cls_idx = int(predicted_classes_sub[i]) if predicted_classes_sub is not None else true_cls_idx
-                                    
-                                    # Skip if we already have enough samples for the true class
-                                    if max_samples_per_class is not None and samples_processed[true_cls_idx] >= max_samples_per_class:
-                                        continue
-                                    
-                                    # Generate explanation for the PREDICTED class only
-                                    try:
-                                        attr = explainer(x_sub_batch[i:i+1], y=pred_cls_idx, show_plot=False)
-                                    except (IndexError, KeyError) as e:
-                                        # If that fails, try with None (let explainer use its default)
-                                        try:
-                                            attr = explainer(x_sub_batch[i:i+1], y=None, show_plot=False)
-                                        except Exception as e2:
-                                            # If both fail, skip this sample
-                                            print(f"    Warning: Could not generate SHAP explanation for sample {i} (true_class={true_cls_idx}, pred_class={pred_cls_idx}): {e2}")
-                                            continue
-                                    
-                                    if attr.ndim == 1:
-                                        attr_clean = attr
-                                    else:
-                                        attr_clean = attr[0]
-                                    # Ensure it's a 1D array of length 1500
-                                    if attr_clean.ndim > 1:
-                                        attr_clean = attr_clean.flatten()
-                                    if len(attr_clean) > 1500:
-                                        attr_clean = attr_clean[:1500]
-                                    elif len(attr_clean) < 1500:
-                                        padded = np.zeros(1500)
-                                        padded[:len(attr_clean)] = attr_clean
-                                        attr_clean = padded
-                                    # Store directly in explanations_by_class by true class (for analysis)
-                                    # But explanation is for predicted class
-                                    explanations_by_class[true_cls_idx].append(attr_clean.copy())
-                                    samples_processed[true_cls_idx] += 1
-                                    
-                                    # Check if we've reached the limit for all classes
-                                    if max_samples_per_class is not None:
-                                        all_done = True
-                                        for c_idx in range(len(class_names)):
-                                            if samples_processed[c_idx] < max_samples_per_class:
-                                                all_done = False
-                                                break
-                                        if all_done:
-                                            need_more = False
-                                            break  # Exit the inner loop
-                                # Set to empty since we've already stored everything
-                                attributions = []
-                                # Check if we should exit outer loops
-                                if not need_more:
-                                    break
-                            elif explainer_name == 'LIME':
-                                # LIME: Process samples in small sub-batch, store directly
-                                # Use PREDICTED class for explanations (not true class)
-                                attributions = []
-                                for i in range(len(targets_sub)):
-                                    true_cls_idx = int(targets_sub[i])
-                                    pred_cls_idx = int(predicted_classes_sub[i]) if predicted_classes_sub is not None else true_cls_idx
-                                    
-                                    # Skip if we already have enough samples for the true class
-                                    if max_samples_per_class is not None and samples_processed[true_cls_idx] >= max_samples_per_class:
-                                        continue
-                                    
-                                    # Generate explanation for the PREDICTED class only
-                                    try:
-                                        attr = explainer(x_sub_batch[i:i+1], y=pred_cls_idx, show_plot=False)
-                                    except (IndexError, KeyError) as e:
-                                        # If that fails, try with None (let explainer use its default)
-                                        try:
-                                            attr = explainer(x_sub_batch[i:i+1], y=None, show_plot=False)
-                                        except Exception as e2:
-                                            # If both fail, skip this sample
-                                            print(f"    Warning: Could not generate LIME explanation for sample {i} (true_class={true_cls_idx}, pred_class={pred_cls_idx}): {e2}")
-                                            continue
-                                    
-                                    if attr.ndim == 1:
-                                        attr_clean = attr
-                                    else:
-                                        attr_clean = attr[0]
-                                    # Ensure it's a 1D array of length 1500
-                                    if attr_clean.ndim > 1:
-                                        attr_clean = attr_clean.flatten()
-                                    if len(attr_clean) > 1500:
-                                        attr_clean = attr_clean[:1500]
-                                    elif len(attr_clean) < 1500:
-                                        padded = np.zeros(1500)
-                                        padded[:len(attr_clean)] = attr_clean
-                                        attr_clean = padded
-                                    # Store directly in explanations_by_class by true class (for analysis)
-                                    # But explanation is for predicted class
-                                    explanations_by_class[true_cls_idx].append(attr_clean.copy())
-                                    samples_processed[true_cls_idx] += 1
-                                    
-                                    # Check if we've reached the limit for all classes
-                                    if max_samples_per_class is not None:
-                                        all_done = True
-                                        for c_idx in range(len(class_names)):
-                                            if samples_processed[c_idx] < max_samples_per_class:
-                                                all_done = False
-                                                break
-                                        if all_done:
-                                            need_more = False
-                                            break  # Exit the inner loop
-                                # Set to empty since we've already stored everything
-                                attributions = []
-                                # Check if we should exit outer loops
-                                if not need_more:
-                                    break
+                            attributions = explainer(x_sub_batch, y=targets_sub, show_plot=False)
+                            
+                            if isinstance(attributions, np.ndarray):
+                                if attributions.size == 0:
+                                    continue
+                                if attributions.ndim == 1:
+                                    attributions = attributions.reshape(1, -1)
+                            elif isinstance(attributions, torch.Tensor):
+                                attributions = attributions.detach().cpu().numpy()
+                                if attributions.ndim == 1:
+                                    attributions = attributions.reshape(1, -1)
                             else:
-                                attributions = explainer(x_sub_batch, y=targets_sub, show_plot=False)
-                        
-                            # Handle different attribution shapes (only for non-SHAP/LIME explainers)
-                            # SHAP and LIME already stored their attributions directly above
-                            if explainer_name not in ['SHAP', 'LIME']:
-                                if isinstance(attributions, np.ndarray):
-                                    if attributions.size == 0:
-                                        # Skip empty arrays
-                                        continue
-                                    if attributions.ndim == 1:
-                                        attributions = attributions.reshape(1, -1)
-                                elif isinstance(attributions, torch.Tensor):
-                                    attributions = attributions.detach().cpu().numpy()
-                                    if attributions.ndim == 1:
-                                        attributions = attributions.reshape(1, -1)
-                                
-                                # Store attributions grouped by true class (for GSENN)
-                                for i in range(len(targets_sub)):
-                                    cls_idx = int(targets_sub[i])
-                                    if max_samples_per_class is None or samples_processed[cls_idx] < max_samples_per_class:
-                                        # Get attributions for this sample
-                                        if attributions.ndim == 2:
-                                            attr_sample = attributions[i]
-                                        else:
-                                            attr_sample = attributions
-                                        
-                                        # Ensure it's a 1D array of length 1500
-                                        if attr_sample.ndim > 1:
-                                            attr_sample = attr_sample.flatten()
-                                        if len(attr_sample) > 1500:
-                                            attr_sample = attr_sample[:1500]
-                                        elif len(attr_sample) < 1500:
-                                            # Pad if needed (shouldn't happen, but be safe)
-                                            padded = np.zeros(1500)
-                                            padded[:len(attr_sample)] = attr_sample
-                                            attr_sample = padded
-                                        
-                                        explanations_by_class[cls_idx].append(attr_sample)
-                                        samples_processed[cls_idx] += 1
-                                        
-                                        # Check if we've reached the limit for all classes
-                                        if max_samples_per_class is not None:
-                                            all_done = True
-                                            for c_idx in range(len(class_names)):
-                                                if samples_processed[c_idx] < max_samples_per_class:
-                                                    all_done = False
-                                                    break
-                                            if all_done:
-                                                need_more = False
-                                                break  # Exit the inner loop
-                                # SHAP and LIME already stored directly above, nothing more to do here
-                                # Check if we should exit outer loops
-                                if not need_more:
-                                    break
+                                attributions = np.array(attributions)
+                                if attributions.ndim == 1:
+                                    attributions = attributions.reshape(1, -1)
+                            
+                            # Store attributions grouped by true class (for GSENN)
+                            for i in range(len(targets_sub)):
+                                cls_idx = int(targets_sub[i])
+                                if max_samples_per_class is None or samples_processed[cls_idx] < max_samples_per_class:
+                                    # Get attributions for this sample
+                                    if attributions.ndim == 2:
+                                        attr_sample = attributions[i]
+                                    else:
+                                        attr_sample = attributions
+                                    
+                                    # Ensure it's a 1D array of length 1500
+                                    if attr_sample.ndim > 1:
+                                        attr_sample = attr_sample.flatten()
+                                    if len(attr_sample) > 1500:
+                                        attr_sample = attr_sample[:1500]
+                                    elif len(attr_sample) < 1500:
+                                        # Pad if needed (shouldn't happen, but be safe)
+                                        padded = np.zeros(1500)
+                                        padded[:len(attr_sample)] = attr_sample
+                                        attr_sample = padded
+                                    
+                                    explanations_by_class[cls_idx].append(attr_sample)
+                                    samples_processed[cls_idx] += 1
+                                    
+                                    # Check if we've reached the limit for all classes
+                                    if max_samples_per_class is not None:
+                                        all_done = True
+                                        for c_idx in range(len(class_names)):
+                                            if samples_processed[c_idx] < max_samples_per_class:
+                                                all_done = False
+                                                break
+                                        if all_done:
+                                            need_more = False
+                                            break  # Exit the inner loop
+                            
+                            # Check if we should exit outer loops
+                            if not need_more:
+                                break
                             
                             # Clear memory after each sub-batch to control memory usage
                             del attributions, x_sub_batch, targets_sub
@@ -1341,9 +1044,9 @@ def main():
         else:
             # Collect explanations from train and test sets for all explainers
             # Keep original sample counts, but process in small batches to save memory
-            max_samples_per_class = {'GSENN': 100, 'SHAP': 50, 'LIME': 50}
+            max_samples_per_class = {'GSENN': 100}
             # Batch sizes for incremental processing (process this many at a time, then aggregate)
-            batch_process_sizes = {'GSENN': 100, 'SHAP': 25, 'LIME': 25}  # Process in small batches
+            batch_process_sizes = {'GSENN': 100}  # Process in small batches
             
             all_train_explanations = {}
             all_test_explanations = {}
