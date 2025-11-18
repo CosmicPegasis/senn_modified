@@ -1,4 +1,5 @@
 import multiprocessing
+from pathlib import Path
 
 import datasets
 import torch
@@ -8,6 +9,48 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from ml.dataset import dataset_collate_function
+
+
+def load_dataset_from_path(data_path):
+    """
+    Load dataset from either a single parquet file or a directory of parquet files.
+    
+    Args:
+        data_path: Path to a parquet file or directory containing parquet files
+        
+    Returns:
+        Dataset object
+    """
+    data_path = Path(data_path)
+    
+    if data_path.is_dir():
+        # Directory: load all parquet files
+        parquet_files = sorted(data_path.glob("*.parquet"))
+        if not parquet_files:
+            raise ValueError(f"No parquet files found in directory: {data_path}")
+        
+        # Load all parquet files
+        if len(parquet_files) == 1:
+            # Single file in directory
+            dataset_dict = datasets.load_dataset("parquet", data_files=str(parquet_files[0]))
+        else:
+            # Multiple files: load all files (they will be automatically concatenated)
+            dataset_dict = datasets.load_dataset(
+                "parquet", 
+                data_files=[str(f) for f in parquet_files]
+            )
+    else:
+        # Single file
+        dataset_dict = datasets.load_dataset("parquet", data_files=str(data_path))
+    
+    # Handle dataset_dict (could be DatasetDict or Dataset)
+    if isinstance(dataset_dict, datasets.Dataset):
+        return dataset_dict
+    elif isinstance(dataset_dict, datasets.DatasetDict):
+        # Get the first split (usually 'train' or first key)
+        return dataset_dict[list(dataset_dict.keys())[0]]
+    else:
+        raise ValueError(f"Unexpected dataset type: {type(dataset_dict)}")
 
 
 class CNN(LightningModule):
@@ -97,9 +140,8 @@ class CNN(LightningModule):
         return x
 
     def train_dataloader(self):
-        # expect to get train folder
-        dataset_dict = datasets.load_dataset(self.hparams.data_path)
-        dataset = dataset_dict[list(dataset_dict.keys())[0]]
+        # Load dataset from file or directory
+        dataset = load_dataset_from_path(self.hparams.data_path)
         try:
             num_workers = multiprocessing.cpu_count()
         except:
@@ -528,9 +570,8 @@ class ResNet(LightningModule):
         return x
 
     def train_dataloader(self):
-        # expect to get train folder
-        dataset_dict = datasets.load_dataset(self.hparams.data_path)
-        dataset = dataset_dict[list(dataset_dict.keys())[0]]
+        # Load dataset from file or directory
+        dataset = load_dataset_from_path(self.hparams.data_path)
         try:
             num_workers = multiprocessing.cpu_count()
         except:
