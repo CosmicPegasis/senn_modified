@@ -204,7 +204,14 @@ def _flow_id_from_tuple(proto: int, src_ip: bytes, dst_ip: bytes, sport: int, dp
 
 # --- minimal pcap reader and pcapng fallback via scapy if needed ---
 def _iter_pcap_packets(path: Path):
-    with open(path, "rb") as f:
+    """
+    Optimized PCAP packet iterator using larger buffers and chunked reading.
+    Uses 1MB buffer to reduce system calls and improve I/O performance.
+    """
+    # Use larger buffer size (1MB) for better I/O performance
+    BUFFER_SIZE = 1024 * 1024  # 1MB buffer
+    
+    with open(path, "rb", buffering=BUFFER_SIZE) as f:
         gh = f.read(24)
         if len(gh) < 24:
             return
@@ -216,6 +223,8 @@ def _iter_pcap_packets(path: Path):
         else:
             return
         pkh_struct = struct.Struct(endian + "IIII")
+        
+        # Read packet headers and data with optimized buffering
         while True:
             pkh = f.read(16)
             if len(pkh) < 16:
@@ -232,16 +241,27 @@ def _iter_pcapng_packets_scapy(path: Path):
     except Exception as e:
         raise RuntimeError("Reading .pcapng requires scapy. Install it or use --pcapng-mode skip.") from e
     rdr = PcapNgReader(str(path))
-    for pkt in rdr:
-        try:
-            yield bytes(pkt)
-        except Exception:
-            continue
+    try:
+        for pkt in rdr:
+            try:
+                yield bytes(pkt)
+            except Exception:
+                continue
+    except Exception as e:
+        # Catch scapy exceptions for malformed blocks during iteration
+        logging.debug(f"Error reading pcapng file {path}: {e}")
+        # Stop iteration gracefully
+        return
 
 def _count_pcap_packets(path: Path) -> int:
-    """Count total number of packets in a pcap file."""
+    """
+    Optimized packet counter that skips reading packet data.
+    Uses larger buffer and seeks past packet data instead of reading it.
+    """
+    BUFFER_SIZE = 1024 * 1024  # 1MB buffer
+    
     count = 0
-    with open(path, "rb") as f:
+    with open(path, "rb", buffering=BUFFER_SIZE) as f:
         gh = f.read(24)
         if len(gh) < 24:
             return 0
@@ -258,9 +278,8 @@ def _count_pcap_packets(path: Path) -> int:
             if len(pkh) < 16:
                 break
             _ts_sec, _ts_usec, incl_len, _orig_len = pkh_struct.unpack(pkh)
-            data = f.read(incl_len)
-            if len(data) < incl_len:
-                break
+            # Seek past packet data instead of reading it (much faster for counting)
+            f.seek(incl_len, 1)  # Seek relative to current position
             count += 1
     return count
 
@@ -272,12 +291,18 @@ def _count_pcapng_packets_scapy(path: Path) -> int:
         raise RuntimeError("Reading .pcapng requires scapy. Install it or use --pcapng-mode skip.") from e
     count = 0
     rdr = PcapNgReader(str(path))
-    for pkt in rdr:
-        try:
-            _ = bytes(pkt)  # Just check if we can read it
-            count += 1
-        except Exception:
-            continue
+    try:
+        for pkt in rdr:
+            try:
+                _ = bytes(pkt)  # Just check if we can read it
+                count += 1
+            except Exception:
+                continue
+    except Exception as e:
+        # Catch scapy exceptions for malformed blocks during iteration
+        logging.debug(f"Error counting packets in pcapng file {path}: {e}")
+        # Return count of packets successfully read so far
+        pass
     return count
 
 
@@ -752,13 +777,14 @@ def process_folder(in_dir: Path, out_root: Path, max_len: int, flush_every: int,
             # Try to load labels from all matching CSVs
             combined_fmap = {}
             for csv_file in matching_csvs:
-                class_label = _extract_class_label_from_csv_filename(csv_file)
-                fmap = _load_flow_labels_from_csv(csv_file, label_override=class_label)
+                # Use labels from CSV file instead of filename-derived labels
+                fmap = _load_flow_labels_from_csv(csv_file, label_override=None)
                 if fmap:
                     # Merge into combined map (later CSVs may overwrite earlier ones for same flow_id)
                     combined_fmap.update(fmap)
-                    logging.info("  ✓ Labels loaded: %s -> %s (class: %s, %d flows)", 
-                                cap.name, csv_file.name, class_label, len(fmap))
+                    unique_labels = set(fmap.values())
+                    logging.info("  ✓ Labels loaded: %s -> %s (%d flows, labels: %s)", 
+                                cap.name, csv_file.name, len(fmap), ", ".join(sorted(unique_labels)))
             
             if combined_fmap:
                 labels_loaded_count += 1
@@ -790,8 +816,8 @@ def process_folder(in_dir: Path, out_root: Path, max_len: int, flush_every: int,
             else:
                 combined_fmap = {}
                 for csv_file in matching_csvs:
-                    class_label = _extract_class_label_from_csv_filename(csv_file)
-                    fmap = _load_flow_labels_from_csv(csv_file, label_override=class_label)
+                    # Use labels from CSV file instead of filename-derived labels
+                    fmap = _load_flow_labels_from_csv(csv_file, label_override=None)
                     if fmap:
                         combined_fmap.update(fmap)
                 if not combined_fmap:
@@ -809,8 +835,8 @@ def process_folder(in_dir: Path, out_root: Path, max_len: int, flush_every: int,
         if matching_csvs:
             combined_fmap = {}
             for csv_file in matching_csvs:
-                class_label = _extract_class_label_from_csv_filename(csv_file)
-                fmap = _load_flow_labels_from_csv(csv_file, label_override=class_label)
+                # Use labels from CSV file instead of filename-derived labels
+                fmap = _load_flow_labels_from_csv(csv_file, label_override=None)
                 if fmap:
                     # Merge into combined map (later CSVs may overwrite earlier ones for same flow_id)
                     combined_fmap.update(fmap)
