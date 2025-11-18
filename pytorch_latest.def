@@ -35,7 +35,8 @@ From: docker.io/pytorch/pytorch:latest
         seaborn \
         scapy \
         tqdm \
-        pandas
+        pandas \
+        pyarrow
 
     echo "Container build complete."
 

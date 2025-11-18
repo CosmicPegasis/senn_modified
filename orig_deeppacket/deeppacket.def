@@ -1,0 +1,107 @@
+Bootstrap: docker
+From: pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
+
+%labels
+    Author cosmic
+    Description "Deep Packet - Encrypted Traffic Classification using Deep Learning"
+    Version 1.0
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    export DEBIAN_FRONTEND=noninteractive
+
+%post
+    set -e
+    echo "Updating apt sources and installing system dependencies..."
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        curl \
+        ca-certificates \
+        libpcap-dev \
+        libgl1 \
+        libglib2.0-0 \
+        pkg-config \
+        openjdk-11-jdk \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+    echo "Setting up Java for PySpark..."
+    export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+    export PATH=$PATH:$JAVA_HOME/bin
+
+    echo "Upgrading pip and installing Python requirements..."
+    pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    # Install core scientific computing libraries
+    pip install --no-cache-dir \
+        numpy \
+        scipy \
+        pandas==1.4.4 \
+        scikit-learn==1.1.2
+
+    # Install PyTorch Lightning and related
+    pip install --no-cache-dir \
+        pytorch-lightning==1.7.7 \
+        tensorboard==2.10.0
+
+    # Install data processing libraries
+    pip install --no-cache-dir \
+        datasets==2.5.1 \
+        pyarrow \
+        pyspark==3.3.0
+
+    # Install network packet processing
+    pip install --no-cache-dir \
+        scapy[complete]==2.5.0rc1
+
+    # Install visualization libraries
+    pip install --no-cache-dir \
+        matplotlib==3.5.3 \
+        seaborn==0.11.2 \
+        plotly==5.10.0
+
+    # Install Jupyter and utilities
+    pip install --no-cache-dir \
+        jupyterlab==3.4.7 \
+        click==8.1.3 \
+        joblib \
+        psutil \
+        tqdm
+
+    echo "Container build complete."
+
+%runscript
+    exec "$@"
+
+%help
+    This Apptainer image contains the Deep Packet environment for encrypted
+    traffic classification using deep learning.
+
+    Dependencies included:
+    - Python 3.10
+    - PyTorch 1.12.1 with CUDA 11.3 support
+    - PyTorch Lightning 1.7.7
+    - Scapy for packet processing
+    - PySpark for data processing
+    - HuggingFace datasets
+    - JupyterLab for notebooks
+    - All visualization and utility libraries
+
+    Usage:
+    - To run preprocessing:
+      apptainer exec deeppacket.sif python preprocessing.py -s /path/to/pcap/ -t output/
+    
+    - To create train/test sets:
+      apptainer exec deeppacket.sif python create_train_test_set.py -s processed_data -t train_test_data
+    
+    - To train CNN model:
+      apptainer exec deeppacket.sif python train_cnn.py -d train.parquet -m model.cnn.model -t app
+    
+    - To train ResNet model:
+      apptainer exec deeppacket.sif python train_resnet.py -d train.parquet -m model.resnet.model -t app
+
